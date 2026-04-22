@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>HikRobot Camera</title>
+<style>
+    body {
+        font-family: var(--vscode-font-family, sans-serif);
+        font-size: 13px;
+        color: var(--vscode-foreground, #ccc);
+        background: var(--vscode-editor-background, #1e1e1e);
+        padding: 12px;
+        margin: 0;
+    }
+    h2 { margin: 0 0 10px; font-size: 15px; }
+    h3 { margin: 16px 0 6px; font-size: 13px; opacity: 0.85; }
+    .row { display: flex; gap: 8px; align-items: center; margin-bottom: 6px; flex-wrap: wrap; }
+    .row label { min-width: 110px; opacity: 0.8; }
+    .row input[type=number], .row input[type=text], .row select {
+        background: var(--vscode-input-background, #333);
+        color: var(--vscode-input-foreground, #eee);
+        border: 1px solid var(--vscode-input-border, #555);
+        padding: 3px 6px; border-radius: 2px; font-size: 12px;
+        width: 130px;
+    }
+    button {
+        padding: 4px 12px; cursor: pointer;
+        border: none; border-radius: 2px;
+        background: var(--vscode-button-background, #0e639c);
+        color: var(--vscode-button-foreground, #fff);
+        font-size: 12px;
+    }
+    button.secondary { background: #555; }
+    .pill { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; margin-left: 6px; }
+    .pill.on  { background: #2e7d32; color: #fff; }
+    .pill.off { background: #666;    color: #eee; }
+    .devlist { max-height: 140px; overflow: auto; border: 1px solid #444; padding: 4px; margin-top: 4px; }
+    .devrow { padding: 3px 6px; cursor: pointer; font-family: monospace; font-size: 11px; }
+    .devrow:hover { background: #333; }
+    .devrow.sel  { background: #094771; }
+    .stat { opacity: 0.7; font-size: 11px; }
+    .err  { color: #ff8a80; font-size: 11px; min-height: 14px; word-break: break-all; }
+    #preview-wrap {
+        margin-top: 8px;
+        border: 1px solid #444; background: #000;
+        min-height: 120px; display: flex; align-items: center; justify-content: center;
+    }
+    #preview { max-width: 100%; display: block; image-rendering: pixelated; }
+    #preview-empty { color: #666; font-size: 11px; padding: 20px; }
+</style>
+</head>
+<body>
+
+<h2>
+    HikRobot Camera (MVS)
+    <span id="connPill" class="pill off">disconnected</span>
+    <span id="streamPill" class="pill off">stopped</span>
+</h2>
+
+<div class="row">
+    <button onclick="cmd('discover')">Discover</button>
+    <button onclick="connect()">Connect</button>
+    <button class="secondary" onclick="cmd('disconnect')">Disconnect</button>
+    <button class="secondary" onclick="cmd('start_streaming')">Start</button>
+    <button class="secondary" onclick="cmd('stop_streaming')">Stop</button>
+</div>
+
+<div id="devices" class="devlist"><div class="stat">no scan yet — click Discover</div></div>
+
+<h3>Image</h3>
+<div class="row">
+    <label>Pixel format</label>
+    <select id="pixfmt" onchange="setFmt()">
+        <option>Mono8</option>
+        <option>RGB8Packed</option>
+        <option>BGR8Packed</option>
+    </select>
+</div>
+<div class="row">
+    <label>ROI x,y,w,h</label>
+    <input id="roi_x" type="number" style="width:60px">
+    <input id="roi_y" type="number" style="width:60px">
+    <input id="roi_w" type="number" style="width:70px">
+    <input id="roi_h" type="number" style="width:70px">
+    <button onclick="setRoi()">Apply</button>
+</div>
+<div class="row">
+    <label>Mirror</label>
+    <label><input id="mx" type="checkbox" onchange="setMirror()"> X</label>
+    <label><input id="my" type="checkbox" onchange="setMirror()"> Y</label>
+</div>
+
+<h3>Exposure / Gain / FPS</h3>
+<div class="row">
+    <label>Frame rate (Hz)</label>
+    <input id="fps" type="number" step="0.1">
+    <button onclick="setFps()">Apply</button>
+    <span class="stat">0 or empty = disable AFR</span>
+</div>
+<div class="row">
+    <label>Exposure (µs)</label>
+    <input id="exp" type="number" step="10">
+    <button onclick="setExp()">Apply</button>
+</div>
+<div class="row">
+    <label>Gain (dB)</label>
+    <input id="gain" type="number" step="0.1">
+    <button onclick="setGain()">Apply</button>
+</div>
+
+<h3>Preview</h3>
+<div id="preview-wrap">
+    <img id="preview" style="display:none">
+    <div id="preview-empty">no frame yet</div>
+</div>
+<div class="stat">preview frame_id: <span id="preview_frame_id">—</span></div>
+
+<h3>Trigger</h3>
+<div class="row">
+    <label>Mode</label>
+    <select id="trig_mode" onchange="setTrigger()">
+        <option value="off">Off (free-run)</option>
+        <option value="on">On (external)</option>
+    </select>
+    <select id="trig_src" onchange="setTrigger()">
+        <option>Software</option>
+        <option>Line0</option>
+        <option>Line1</option>
+        <option>Line2</option>
+    </select>
+</div>
+<div class="row">
+    <label>Software trigger</label>
+    <input id="trig_count" type="number" value="1" style="width:80px">
+    <button onclick="fireTrigger()">Fire</button>
+    <span class="stat">burst of N triggers, no spacing</span>
+</div>
+<div class="row">
+    <label>Strict mode</label>
+    <label><input id="strict" type="checkbox" onchange="setStrict()">
+           emit placeholder on missed trigger (keeps 1:1 trigger→frame)</label>
+</div>
+<div class="row">
+    <label>Strict timeout</label>
+    <input id="strict_timeout" type="number" style="width:90px" onchange="setStrict()">
+    <span class="stat">ms; 0 = derive from exposure + 200ms slack</span>
+</div>
+<div class="stat">
+    sent: <span id="trig_sent">0</span> ·
+    accepted: <span id="trig_acc">0</span> ·
+    <span style="color:#ff8a80">overruns: <span id="trig_over">0</span></span>
+</div>
+
+<h3>Stats</h3>
+<div class="stat">
+    captured: <span id="captured">0</span> ·
+    dropped: <span id="dropped">0</span> ·
+    lost_packets: <span id="lost">0</span>
+</div>
+<div class="err" id="err"></div>
+
+<script>
+    const vscode = acquireVsCodeApi();
+    let selectedIndex = -1;
+    let selectedKey   = "";
+
+    function cmd(command, extra) {
+        vscode.postMessage({ type: 'exchange', cmd: Object.assign({ command }, extra || {}) });
+    }
+    function connect() {
+        if (selectedIndex >= 0)      cmd('connect', { index: selectedIndex });
+        else if (selectedKey)        cmd('connect', { device_key: selectedKey });
+        else                         cmd('connect');
+    }
+    function setRoi() {
+        cmd('set_roi', {
+            x: +document.getElementById('roi_x').value || 0,
+            y: +document.getElementById('roi_y').value || 0,
+            w: +document.getElementById('roi_w').value || 0,
+            h: +document.getElementById('roi_h').value || 0,
+        });
+    }
+    function setFps()    { cmd('set_frame_rate',  { value: +document.getElementById('fps').value  }); }
+    function setExp()    { cmd('set_exposure',    { value: +document.getElementById('exp').value  }); }
+    function setGain()   { cmd('set_gain',        { value: +document.getElementById('gain').value }); }
+    function setFmt()    { cmd('set_pixel_format',{ value: document.getElementById('pixfmt').value }); }
+    function setMirror() {
+        cmd('set_mirror', {
+            mirror_x: document.getElementById('mx').checked,
+            mirror_y: document.getElementById('my').checked,
+        });
+    }
+    function setTrigger() {
+        cmd('set_trigger_mode', {
+            mode:   document.getElementById('trig_mode').value,
+            source: document.getElementById('trig_src').value,
+        });
+    }
+    function fireTrigger() {
+        const n = Math.max(1, +document.getElementById('trig_count').value || 1);
+        cmd('software_trigger', { count: n });
+    }
+    function setStrict() {
+        cmd('set_strict_trigger_mode', {
+            value:      document.getElementById('strict').checked,
+            timeout_ms: +document.getElementById('strict_timeout').value || 0,
+        });
+    }
+
+    function renderDevices(labels, keys) {
+        const box = document.getElementById('devices');
+        if (!labels || labels.length === 0) {
+            box.innerHTML = '<div class="stat">no devices found — is MVS running? is the camera on?</div>';
+            return;
+        }
+        box.innerHTML = '';
+        labels.forEach((lab, i) => {
+            const row = document.createElement('div');
+            row.className = 'devrow' + (i === selectedIndex ? ' sel' : '');
+            row.textContent = '[' + i + '] ' + lab;
+            row.onclick = () => {
+                selectedIndex = i;
+                selectedKey   = (keys && keys[i]) || '';
+                renderDevices(labels, keys);
+            };
+            box.appendChild(row);
+        });
+    }
+
+    function setPill(id, on, labelOn, labelOff) {
+        const p = document.getElementById(id);
+        p.className = 'pill ' + (on ? 'on' : 'off');
+        p.textContent = on ? labelOn : labelOff;
+    }
+
+    function setInputIfClean(id, value) {
+        const el = document.getElementById(id);
+        if (document.activeElement !== el) el.value = value;
+    }
+
+    window.addEventListener('message', e => {
+        if (e.data.type !== 'status') return;
+        const s = e.data;
+        // get_preview replies share the same channel but have a different
+        // payload shape — skip the field-by-field stomp below when we see
+        // one (it's handled by the dedicated preview listener further down).
+        if ('has_frame' in s && !('connected' in s)) return;
+        setPill('connPill',   !!s.connected, 'connected',  'disconnected');
+        setPill('streamPill', !!s.streaming, 'streaming',  'stopped');
+        setInputIfClean('roi_x', s.roi_x ?? 0);
+        setInputIfClean('roi_y', s.roi_y ?? 0);
+        setInputIfClean('roi_w', s.roi_w ?? 0);
+        setInputIfClean('roi_h', s.roi_h ?? 0);
+        setInputIfClean('fps',   s.fps ?? 0);
+        setInputIfClean('exp',   s.exposure_us ?? '');
+        setInputIfClean('gain',  s.gain ?? '');
+        if (document.activeElement.id !== 'pixfmt')
+            document.getElementById('pixfmt').value = s.pixel_format || 'Mono8';
+        document.getElementById('mx').checked = !!s.mirror_x;
+        document.getElementById('my').checked = !!s.mirror_y;
+        document.getElementById('captured').textContent = s.captured ?? 0;
+        document.getElementById('dropped').textContent  = s.dropped  ?? 0;
+        document.getElementById('lost').textContent     = s.lost_packets ?? 0;
+        if (document.activeElement.id !== 'trig_mode')
+            document.getElementById('trig_mode').value = s.trigger_mode   || 'off';
+        if (document.activeElement.id !== 'trig_src')
+            document.getElementById('trig_src').value  = s.trigger_source || 'Software';
+        document.getElementById('trig_sent').textContent = s.triggers_sent ?? 0;
+        document.getElementById('trig_acc').textContent  = s.triggers_accepted ?? 0;
+        document.getElementById('trig_over').textContent = s.overruns ?? 0;
+        if (document.activeElement.id !== 'strict')
+            document.getElementById('strict').checked = !!s.strict_trigger_mode;
+        if (document.activeElement.id !== 'strict_timeout')
+            document.getElementById('strict_timeout').value = s.strict_timeout_ms ?? 0;
+        document.getElementById('err').textContent      = s.last_error || '';
+        if (s.devices) renderDevices(s.devices, s.device_keys);
+    });
+
+    // Preview stream: get_preview comes back via the same 'status' channel,
+    // so we distinguish by the presence of `jpeg_b64` in the payload.
+    let lastPreviewFrameId = -1;
+    window.addEventListener('message', e => {
+        if (e.data.type !== 'status') return;
+        const s = e.data;
+        if (!('jpeg_b64' in s) && !('has_frame' in s)) return;
+        const img   = document.getElementById('preview');
+        const empty = document.getElementById('preview-empty');
+        if (s.has_frame && s.jpeg_b64) {
+            img.src = 'data:image/jpeg;base64,' + s.jpeg_b64;
+            img.style.display = 'block';
+            empty.style.display = 'none';
+            lastPreviewFrameId = s.frame_id;
+            document.getElementById('preview_frame_id').textContent = s.frame_id;
+        }
+    });
+
+    cmd('get_status');
+    setInterval(() => cmd('get_status'), 750);
+    setInterval(() => cmd('get_preview', { max_side: 480, quality: 60 }), 400);
+</script>
+
+</body>
+</html>

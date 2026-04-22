@@ -1,0 +1,25 @@
+# Build artifacts
+build/
+*.dll
+*.exe
+*.exp
+*.lib
+*.obj
+*.pdb
+
+# Generated at build time
+cert.json
+
+# Test capture outputs
+test_two_cam_cam*.jpg
+*.png
+
+# IDE / editor
+.vs/
+.vscode/
+*.swp
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store

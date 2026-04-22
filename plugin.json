@@ -1,0 +1,7 @@
+{
+  "name": "hikrobot_camera",
+  "description": "HikRobot / HIKVISION industrial camera source via MVS SDK (USB3 Vision + GigE Vision).",
+  "dll": "hikrobot_camera.dll",
+  "factory": "xi_plugin_create",
+  "has_ui": true
+}
