@@ -415,6 +415,72 @@ public:
         else if (command == "get_preview")       return get_preview_json(p["max_side"].as_int(480),
                                                                           p["quality"].as_int(70));
         else if (command == "diag")              return diag_json();
+        else if (command == "get_schema")        return get_schema_json();
+        else if (command == "save_to_userset") {
+            // Persist current camera settings into a writable UserSet
+            // so they survive power-cycle. "Default" is read-only
+            // factory; writable slots are UserSet1 / UserSet2 / UserSet3.
+            if (!handle_) return R"({"ok":false,"error":"not_connected"})";
+            std::string which = p["userset"].as_string("UserSet1");
+            int r1 = MV_CC_SetEnumValueByString(handle_, "UserSetSelector", which.c_str());
+            int r2 = MV_OK;
+            if (r1 == MV_OK) {
+                r2 = MV_CC_SetCommandValue(handle_, "UserSetSave");
+            }
+            // Optional: also set this userset as the power-on default
+            // when the caller passes "set_default":true.
+            int r3 = MV_OK;
+            if (r2 == MV_OK && p["set_default"].as_bool(false)) {
+                // Some firmwares use "UserSetDefault", others
+                // "UserSetDefaultSelector" — try the common one.
+                r3 = MV_CC_SetEnumValueByString(handle_, "UserSetDefault", which.c_str());
+            }
+            auto out = xi::Json::object();
+            out.set("ok", r1 == MV_OK && r2 == MV_OK);
+            out.set("userset", which);
+            if (r1 != MV_OK) out.set("select_err", r1);
+            if (r2 != MV_OK) out.set("save_err",   r2);
+            if (p["set_default"].as_bool(false)) {
+                out.set("default_set", r3 == MV_OK);
+                if (r3 != MV_OK) out.set("default_err", r3);
+            }
+            return out.dump();
+        }
+        else if (command == "reset_to_default") {
+            // Global reset — load the camera's factory-default UserSet.
+            // GenICam standard feature. Requires the camera to be out
+            // of acquisition when loaded; we stop/restart around it.
+            if (!handle_) return R"({"ok":false,"error":"not_connected"})";
+            bool was_streaming = streaming_.load();
+            stop_streaming();
+            // UserSetSelector accepts "Default", "UserSet0", "UserSet1".
+            // HikRobot exposes all three; "Default" is read-only factory.
+            std::string which = p["userset"].as_string("Default");
+            int r1 = MV_CC_SetEnumValueByString(handle_, "UserSetSelector", which.c_str());
+            int r2 = MV_OK;
+            if (r1 == MV_OK) {
+                r2 = MV_CC_SetCommandValue(handle_, "UserSetLoad");
+            }
+            // Reading-back-and-caching the features we rely on keeps
+            // the plugin's shadow state consistent with the reloaded
+            // camera state (otherwise an `apply_*` call would push
+            // pre-reset cached values back).
+            if (r2 == MV_OK) {
+                read_back_roi();
+                MVCC_FLOATVALUE fv{};
+                if (MV_CC_GetFloatValue(handle_, "ExposureTime", &fv) == MV_OK)
+                    exposure_us_ = (double)fv.fCurValue;
+                if (MV_CC_GetFloatValue(handle_, "Gain", &fv) == MV_OK)
+                    gain_ = (double)fv.fCurValue;
+            }
+            if (was_streaming) start_streaming();
+            auto out = xi::Json::object();
+            out.set("ok", r1 == MV_OK && r2 == MV_OK);
+            out.set("userset", which);
+            if (r1 != MV_OK) out.set("select_err", r1);
+            if (r2 != MV_OK) out.set("load_err",   r2);
+            return out.dump();
+        }
         else if (command == "debug_drop_every_n") {
             debug_drop_every_n_ = p["value"].as_int(0);
             return xi::Json::object()
@@ -986,6 +1052,12 @@ private:
         MV_CC_SetBoolValue(handle_, "AcquisitionFrameRateEnable", true);
         int r = MV_CC_SetFloatValue(handle_, "AcquisitionFrameRate", (float)fps);
         if (r != MV_OK) set_error(mv_err(r, "AcquisitionFrameRate"));
+        // Readback: camera may clamp to [min,max] or snap to its
+        // internal increment. Update shadow state so get_status
+        // reports the ACTUAL applied value, not the requested one.
+        MVCC_FLOATVALUE v{};
+        if (MV_CC_GetFloatValue(handle_, "AcquisitionFrameRate", &v) == MV_OK)
+            fps_ = (double)v.fCurValue;
     }
 
     void apply_exposure(double us) {
@@ -998,6 +1070,10 @@ private:
         MV_CC_SetEnumValueByString(handle_, "ExposureAuto", "Off");
         int r = MV_CC_SetFloatValue(handle_, "ExposureTime", (float)us);
         if (r != MV_OK) set_error(mv_err(r, "ExposureTime"));
+        // Readback clamped / snapped value.
+        MVCC_FLOATVALUE v{};
+        if (MV_CC_GetFloatValue(handle_, "ExposureTime", &v) == MV_OK)
+            exposure_us_ = (double)v.fCurValue;
     }
 
     void apply_gain(double db) {
@@ -1009,6 +1085,9 @@ private:
         MV_CC_SetEnumValueByString(handle_, "GainAuto", "Off");
         int r = MV_CC_SetFloatValue(handle_, "Gain", (float)db);
         if (r != MV_OK) set_error(mv_err(r, "Gain"));
+        MVCC_FLOATVALUE v{};
+        if (MV_CC_GetFloatValue(handle_, "Gain", &v) == MV_OK)
+            gain_ = (double)v.fCurValue;
     }
 
     void apply_mirror(bool x, bool y) {
@@ -1336,8 +1415,7 @@ private:
 
         MvGvspPixelType src_fmt = info.enPixelType;
         int channels = 0;
-        const uint8_t* src = pstFrame->pBufAddr;
-        std::vector<uint8_t> converted;
+        bool need_convert = false;
 
         switch (src_fmt) {
             case PixelType_Gvsp_Mono8:
@@ -1347,30 +1425,42 @@ private:
             case PixelType_Gvsp_BGR8_Packed:
                 channels = 3;
                 break;
-            default: {
+            default:
                 // Convert anything else (Bayer, 10/12-bit, YUV) to BGR8.
                 channels = 3;
-                converted.resize((size_t)w * h * 3);
-                MV_CC_PIXEL_CONVERT_PARAM cp{};
-                cp.nWidth         = (unsigned short)w;
-                cp.nHeight        = (unsigned short)h;
-                cp.pSrcData       = pstFrame->pBufAddr;
-                cp.nSrcDataLen    = pstFrame->stFrameInfo.nFrameLen;
-                cp.enSrcPixelType = src_fmt;
-                cp.enDstPixelType = PixelType_Gvsp_BGR8_Packed;
-                cp.pDstBuffer     = converted.data();
-                cp.nDstBufferSize = (unsigned)converted.size();
-                int r = MV_CC_ConvertPixelType(handle_, &cp);
-                if (r != MV_OK) {
-                    dropped_.fetch_add(1);
-                    return;
-                }
-                src = converted.data();
+                need_convert = true;
                 break;
-            }
         }
 
-        xi::Image img(w, h, channels, src);
+        xi::Image img;
+        if (need_convert) {
+            // Allocate + convert directly into the image buffer. Before:
+            // malloc 60MB 'converted' + MVS convert-into-it + xi::Image
+            // copies from 'converted' into its own vector. Now: one alloc,
+            // MVS writes directly into the Image's buffer. Saves one
+            // full-frame malloc + one full-frame memcpy per color frame
+            // (~60 MB at 20 MP BGR8).
+            img = xi::Image(w, h, 3);
+            MV_CC_PIXEL_CONVERT_PARAM cp{};
+            cp.nWidth         = (unsigned short)w;
+            cp.nHeight        = (unsigned short)h;
+            cp.pSrcData       = pstFrame->pBufAddr;
+            cp.nSrcDataLen    = pstFrame->stFrameInfo.nFrameLen;
+            cp.enSrcPixelType = src_fmt;
+            cp.enDstPixelType = PixelType_Gvsp_BGR8_Packed;
+            cp.pDstBuffer     = img.data();
+            cp.nDstBufferSize = (unsigned)((size_t)w * h * 3);
+            int r = MV_CC_ConvertPixelType(handle_, &cp);
+            if (r != MV_OK) {
+                dropped_.fetch_add(1);
+                return;
+            }
+        } else {
+            // Passthrough Mono8 / RGB8 / BGR8: xi::Image's range-copy
+            // constructor does exactly one memcpy with no zero-init —
+            // cheaper than the allocate-then-memcpy path for passthrough.
+            img = xi::Image(w, h, channels, pstFrame->pBufAddr);
+        }
         int64_t frame_host_ns   = (int64_t)info.nHostTimeStamp;
         int64_t frame_device_ns =
             ((int64_t)info.nDevTimeStampHigh << 32) | (int64_t)info.nDevTimeStampLow;
@@ -1545,6 +1635,134 @@ private:
     // Reads back what the camera actually has configured so we can see
     // whether our set_* commands took effect (or whether some feature
     // is capping the framerate).
+    // Schema for UI auto-generation. Curated list of user-facing
+    // features, each tagged with its GenICam type, current value, and
+    // the camera's declared range / enum options. The UI walks this
+    // and renders the right control (slider, dropdown, checkbox).
+    std::string get_schema_json() {
+        auto arr = xi::Json::array();
+        if (!handle_) {
+            auto err = xi::Json::object();
+            err.set("error", "not_connected");
+            return err.dump();
+        }
+
+        auto add_int = [&](const char* key, const char* label,
+                           const char* group) {
+            MVCC_INTVALUE v{};
+            if (MV_CC_GetIntValue(handle_, key, &v) != MV_OK) return;
+            auto row = xi::Json::object();
+            row.set("name",  key);
+            row.set("label", label);
+            row.set("group", group);
+            row.set("type",  "int");
+            row.set("cur",   (int)v.nCurValue);
+            row.set("min",   (int)v.nMin);
+            row.set("max",   (int)v.nMax);
+            row.set("inc",   (int)v.nInc);
+            arr.push(row);
+        };
+        auto add_float = [&](const char* key, const char* label,
+                             const char* group, const char* unit) {
+            MVCC_FLOATVALUE v{};
+            if (MV_CC_GetFloatValue(handle_, key, &v) != MV_OK) return;
+            auto row = xi::Json::object();
+            row.set("name",  key);
+            row.set("label", label);
+            row.set("group", group);
+            row.set("type",  "float");
+            row.set("cur",   (double)v.fCurValue);
+            row.set("min",   (double)v.fMin);
+            row.set("max",   (double)v.fMax);
+            if (unit) row.set("unit", unit);
+            arr.push(row);
+        };
+        auto add_bool = [&](const char* key, const char* label,
+                            const char* group) {
+            bool b = false;
+            if (MV_CC_GetBoolValue(handle_, key, &b) != MV_OK) return;
+            auto row = xi::Json::object();
+            row.set("name",  key);
+            row.set("label", label);
+            row.set("group", group);
+            row.set("type",  "bool");
+            row.set("cur",   b);
+            arr.push(row);
+        };
+        auto add_enum = [&](const char* key, const char* label,
+                            const char* group) {
+            MVCC_ENUMVALUE v{};
+            if (MV_CC_GetEnumValue(handle_, key, &v) != MV_OK) return;
+            auto row = xi::Json::object();
+            row.set("name",  key);
+            row.set("label", label);
+            row.set("group", group);
+            row.set("type",  "enum");
+            // Resolve current-value int → symbolic string.
+            auto cur_sym = xi::Json::object();
+            {
+                MVCC_ENUMENTRY e{};
+                e.nValue = v.nCurValue;
+                if (MV_CC_GetEnumEntrySymbolic(handle_, key, &e) == MV_OK) {
+                    row.set("cur", e.chSymbolic);
+                }
+            }
+            auto values = xi::Json::array();
+            for (unsigned i = 0; i < v.nSupportedNum; ++i) {
+                MVCC_ENUMENTRY e{};
+                e.nValue = v.nSupportValue[i];
+                if (MV_CC_GetEnumEntrySymbolic(handle_, key, &e) == MV_OK) {
+                    values.push(std::string(e.chSymbolic));
+                }
+            }
+            row.set("values", values);
+            arr.push(row);
+        };
+
+        // Image group
+        add_enum ("PixelFormat",              "Pixel format",          "image");
+        add_int  ("Width",                    "Width",                 "image");
+        add_int  ("Height",                   "Height",                "image");
+        add_int  ("OffsetX",                  "Offset X",              "image");
+        add_int  ("OffsetY",                  "Offset Y",              "image");
+        add_bool ("ReverseX",                 "Mirror X",              "image");
+        add_bool ("ReverseY",                 "Mirror Y",              "image");
+
+        // Exposure / gain group
+        add_enum ("ExposureAuto",             "Exposure auto",         "exposure");
+        add_float("ExposureTime",             "Exposure",              "exposure", "us");
+        add_enum ("GainAuto",                 "Gain auto",             "exposure");
+        add_float("Gain",                     "Gain",                  "exposure", "dB");
+
+        // Acquisition group
+        add_enum ("AcquisitionMode",          "Acquisition mode",      "acquisition");
+        add_bool ("AcquisitionFrameRateEnable","AFR enable",           "acquisition");
+        add_float("AcquisitionFrameRate",     "Frame rate",            "acquisition", "Hz");
+        add_float("ResultingFrameRate",       "Resulting FPS (ro)",    "acquisition", "Hz");
+
+        // Trigger group
+        add_enum ("TriggerSelector",          "Trigger selector",      "trigger");
+        add_enum ("TriggerMode",              "Trigger mode",          "trigger");
+        add_enum ("TriggerSource",            "Trigger source",        "trigger");
+        add_enum ("TriggerActivation",        "Trigger activation",    "trigger");
+        add_float("TriggerDelay",             "Trigger delay",         "trigger", "us");
+
+        // Transport (read-only diagnostics)
+        add_enum ("DeviceLinkSpeed",          "Link speed class",      "transport");
+        add_int  ("DeviceLinkSpeedInBps",     "Link speed (B/s)",      "transport");
+        add_int  ("DeviceLinkCurrentThroughput","Throughput (B/s)",    "transport");
+
+        // User-set management
+        add_enum ("UserSetSelector",          "User-set selector",     "userset");
+
+        auto root = xi::Json::object();
+        root.set("features", arr);
+        root.set("groups",   xi::Json::array()
+            .push("image").push("exposure").push("acquisition")
+            .push("trigger").push("transport").push("userset"));
+        return root.dump();
+    }
+
     std::string diag_json() {
         auto obj = xi::Json::object();
         obj.set("has_handle", handle_ != nullptr);

@@ -238,8 +238,21 @@ int main() {
         }
         syms.destroy(p);
     }
-    if (keys.size() < 2) return die("need 2 cameras visible to MVS");
-    std::printf("using cameras:\n  A = %s\n  B = %s\n\n", keys[0].c_str(), keys[1].c_str());
+    // With >2 cameras on the bus (common on this dev machine), pick the
+    // two we've characterized: MV-CA050 (K47674142) + MV-CE200 (00DA5328883).
+    // Fall back to the first two enumerated if those aren't plugged in.
+    auto find_key = [&](const char* serial) -> std::string {
+        for (auto& k : keys) if (k.find(serial) != std::string::npos) return k;
+        return {};
+    };
+    std::string keyA = find_key("K47674142");
+    std::string keyB = find_key("00DA5328883");
+    if (keyA.empty() || keyB.empty()) {
+        if (keys.size() < 2) return die("need 2 cameras visible to MVS");
+        keyA = keys[0]; keyB = keys[1];
+    }
+    keys = {keyA, keyB};
+    std::printf("using cameras:\n  A = %s\n  B = %s\n\n", keyA.c_str(), keyB.c_str());
 
     // Single-camera-at-a-time isolation: configure A alone, run the
     // full sequence, tear down, then do the same for B. If one cam at
@@ -423,15 +436,42 @@ int main() {
     std::printf("both cameras armed (strict, Line0, split connect→arm flow)\n\n");
 
 
-    // Sustainable rate check: 15 Hz × 60 s. Both cams should fully
-    // keep up (well under sensor limits even at full res) → expect
-    // zero missed, zero miss-pattern-mismatches, full 1:1:1 edge =
-    // frame = record chain.
-    const int N = 900;
-    std::printf("sustainable-rate baseline: 15 Hz x 60 s = %d edges per cam\n\n", N);
-    trig.write_line("BURST N=900 HZ=15 WIDTH=200 MASK=0x3");
-    std::this_thread::sleep_for(std::chrono::milliseconds(60500));
-    std::this_thread::sleep_for(std::chrono::seconds(3));
+    // Wiring probe: fire each MASK alone for 5 pulses @ 5 Hz and read
+    // back each cam's line0_edges to see which cam is on which ESP32
+    // pin (GPIO 32 = MASK 0x1, GPIO 33 = MASK 0x2).
+    const int N = 25;
+    auto read_edges = [&](Cam& c) {
+        char sb[4096];
+        syms.exchange(c.inst, R"({"command":"get_status"})", sb, sizeof(sb));
+        return peek_int(sb, "line0_edges");
+    };
+
+    std::printf("\n=== wiring probe ===\n");
+    int A0 = read_edges(A), B0 = read_edges(B);
+
+    std::printf("fire 5 @ 5 Hz on MASK=0x1 (GPIO 32)\n");
+    trig.write_line("BURST N=5 HZ=5 WIDTH=200 MASK=0x1");
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    int A1 = read_edges(A), B1 = read_edges(B);
+    std::printf("  A received %d edges, B received %d edges\n", A1 - A0, B1 - B0);
+
+    std::printf("fire 5 @ 5 Hz on MASK=0x2 (GPIO 33)\n");
+    trig.write_line("BURST N=5 HZ=5 WIDTH=200 MASK=0x2");
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    int A2 = read_edges(A), B2 = read_edges(B);
+    std::printf("  A received %d edges, B received %d edges\n", A2 - A1, B2 - B1);
+
+    std::printf("fire 5 @ 5 Hz on MASK=0x3 (both pins)\n");
+    trig.write_line("BURST N=5 HZ=5 WIDTH=200 MASK=0x3");
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    int A3 = read_edges(A), B3 = read_edges(B);
+    std::printf("  A received %d edges, B received %d edges\n\n", A3 - A2, B3 - B2);
+
+    // Main capture run.
+    std::printf("simple 5 Hz x 2 s on both cams (MASK=0x3)\n\n");
+    trig.write_line("BURST N=10 HZ=5 WIDTH=200 MASK=0x3");
+    std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+    std::this_thread::sleep_for(std::chrono::seconds(2));
 
     // Pre-drain status: report actual resolution + sensor-level counters
     // so we can tell whether the camera really shot at full res and

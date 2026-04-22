@@ -148,6 +148,70 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_ts_dump.cpp)
     add_dependencies(hikrobot_ts_dump hikrobot_camera)
 endif()
 
+# --- Probe any cam at its persisted ROI (no ROI change) ---------------
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_any_cam_noroi.cpp)
+    xinsp2_add_plugin_test(hikrobot_any_cam_noroi tests/test_any_cam_noroi.cpp)
+    target_compile_definitions(hikrobot_any_cam_noroi PRIVATE
+        HIKROBOT_CAMERA_DLL_PATH="${CMAKE_CURRENT_SOURCE_DIR}/hikrobot_camera.dll")
+    add_dependencies(hikrobot_any_cam_noroi hikrobot_camera)
+endif()
+
+# --- Sweep any camera by device_key: full-res 10 fps 5 s --------------
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_any_cam.cpp)
+    xinsp2_add_plugin_test(hikrobot_any_cam tests/test_any_cam.cpp)
+    target_compile_definitions(hikrobot_any_cam PRIVATE
+        HIKROBOT_CAMERA_DLL_PATH="${CMAKE_CURRENT_SOURCE_DIR}/hikrobot_camera.dll")
+    add_dependencies(hikrobot_any_cam hikrobot_camera)
+endif()
+
+# --- CA050 alone free-run ---------------------------------------------
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_ca050_alone.cpp)
+    xinsp2_add_plugin_test(hikrobot_ca050_alone tests/test_ca050_alone.cpp)
+    target_compile_definitions(hikrobot_ca050_alone PRIVATE
+        HIKROBOT_CAMERA_DLL_PATH="${CMAKE_CURRENT_SOURCE_DIR}/hikrobot_camera.dll")
+    add_dependencies(hikrobot_ca050_alone hikrobot_camera)
+endif()
+
+# --- Free-run four-cam streaming at 10 fps each -----------------------
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_four_cam_freerun.cpp)
+    xinsp2_add_plugin_test(hikrobot_four_cam_freerun tests/test_four_cam_freerun.cpp)
+    target_compile_definitions(hikrobot_four_cam_freerun PRIVATE
+        HIKROBOT_CAMERA_DLL_PATH="${CMAKE_CURRENT_SOURCE_DIR}/hikrobot_camera.dll")
+    add_dependencies(hikrobot_four_cam_freerun hikrobot_camera)
+endif()
+
+# --- Free-run three-cam streaming at 10 fps each ----------------------
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_three_cam_freerun.cpp)
+    xinsp2_add_plugin_test(hikrobot_three_cam_freerun tests/test_three_cam_freerun.cpp)
+    target_compile_definitions(hikrobot_three_cam_freerun PRIVATE
+        HIKROBOT_CAMERA_DLL_PATH="${CMAKE_CURRENT_SOURCE_DIR}/hikrobot_camera.dll")
+    add_dependencies(hikrobot_three_cam_freerun hikrobot_camera)
+endif()
+
+# --- Free-run two-cam streaming at 10 fps each ------------------------
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_two_cam_freerun.cpp)
+    xinsp2_add_plugin_test(hikrobot_two_cam_freerun tests/test_two_cam_freerun.cpp)
+    target_compile_definitions(hikrobot_two_cam_freerun PRIVATE
+        HIKROBOT_CAMERA_DLL_PATH="${CMAKE_CURRENT_SOURCE_DIR}/hikrobot_camera.dll")
+    add_dependencies(hikrobot_two_cam_freerun hikrobot_camera)
+endif()
+
+# --- Readback probe: verify apply_* shadow-state is camera truth ------
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_readback.cpp)
+    xinsp2_add_plugin_test(hikrobot_readback tests/test_readback.cpp)
+    target_compile_definitions(hikrobot_readback PRIVATE
+        HIKROBOT_CAMERA_DLL_PATH="${CMAKE_CURRENT_SOURCE_DIR}/hikrobot_camera.dll")
+    add_dependencies(hikrobot_readback hikrobot_camera)
+endif()
+
+# --- Schema probe: dump get_schema JSON -------------------------------
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_schema.cpp)
+    xinsp2_add_plugin_test(hikrobot_schema tests/test_schema.cpp)
+    target_compile_definitions(hikrobot_schema PRIVATE
+        HIKROBOT_CAMERA_DLL_PATH="${CMAKE_CURRENT_SOURCE_DIR}/hikrobot_camera.dll")
+    add_dependencies(hikrobot_schema hikrobot_camera)
+endif()
+
 # --- CE200 alone full-res 10 Hz / 10 s --------------------------------
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_ce200_alone.cpp)
     xinsp2_add_plugin_test(hikrobot_ce200_alone tests/test_ce200_alone.cpp)

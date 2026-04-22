@@ -128,6 +128,7 @@
         <option>Line1</option>
         <option>Line2</option>
     </select>
+    <button class="secondary" onclick="cmd('get_schema')">refresh options</button>
 </div>
 <div class="row">
     <label>Software trigger</label>
@@ -151,6 +152,24 @@
     <span style="color:#ff8a80">overruns: <span id="trig_over">0</span></span>
 </div>
 
+<h3>User-set / save / reset</h3>
+<div class="row">
+    <label>User-set</label>
+    <select id="userset">
+        <option>Default</option>
+    </select>
+    <button onclick="saveToUserSet()">Save</button>
+    <button onclick="resetToUserSet()">Load</button>
+    <label><input id="userset_boot" type="checkbox"> use as power-on default</label>
+</div>
+<div class="stat">
+    "Save" writes current camera settings to the selected slot (persists
+    across power-cycle). "Default" is factory-read-only — writes go to
+    UserSet1/2/3. Tick "power-on default" to have the camera auto-load
+    this slot after a cold boot.
+</div>
+<div id="err_reset" class="err"></div>
+
 <h3>Stats</h3>
 <div class="stat">
     captured: <span id="captured">0</span> ·
@@ -167,25 +186,32 @@
     function cmd(command, extra) {
         vscode.postMessage({ type: 'exchange', cmd: Object.assign({ command }, extra || {}) });
     }
+    // After a setter, poll status once almost-immediately so the UI
+    // reflects the camera's actual applied value (which the camera may
+    // clamp or snap differently than what the user typed).
+    function cmdSet(command, extra) {
+        cmd(command, extra);
+        setTimeout(() => cmd('get_status'), 80);
+    }
     function connect() {
         if (selectedIndex >= 0)      cmd('connect', { index: selectedIndex });
         else if (selectedKey)        cmd('connect', { device_key: selectedKey });
         else                         cmd('connect');
     }
     function setRoi() {
-        cmd('set_roi', {
+        cmdSet('set_roi', {
             x: +document.getElementById('roi_x').value || 0,
             y: +document.getElementById('roi_y').value || 0,
             w: +document.getElementById('roi_w').value || 0,
             h: +document.getElementById('roi_h').value || 0,
         });
     }
-    function setFps()    { cmd('set_frame_rate',  { value: +document.getElementById('fps').value  }); }
-    function setExp()    { cmd('set_exposure',    { value: +document.getElementById('exp').value  }); }
-    function setGain()   { cmd('set_gain',        { value: +document.getElementById('gain').value }); }
-    function setFmt()    { cmd('set_pixel_format',{ value: document.getElementById('pixfmt').value }); }
+    function setFps()    { cmdSet('set_frame_rate',  { value: +document.getElementById('fps').value  }); }
+    function setExp()    { cmdSet('set_exposure',    { value: +document.getElementById('exp').value  }); }
+    function setGain()   { cmdSet('set_gain',        { value: +document.getElementById('gain').value }); }
+    function setFmt()    { cmdSet('set_pixel_format',{ value: document.getElementById('pixfmt').value }); }
     function setMirror() {
-        cmd('set_mirror', {
+        cmdSet('set_mirror', {
             mirror_x: document.getElementById('mx').checked,
             mirror_y: document.getElementById('my').checked,
         });
@@ -205,6 +231,81 @@
             value:      document.getElementById('strict').checked,
             timeout_ms: +document.getElementById('strict_timeout').value || 0,
         });
+    }
+    function resetToUserSet() {
+        const which = document.getElementById('userset').value || 'Default';
+        cmd('reset_to_default', { userset: which });
+        // Re-query schema after a short beat so the UI reflects the
+        // reloaded settings.
+        setTimeout(() => cmd('get_schema'), 500);
+        setTimeout(() => cmd('get_status'), 500);
+    }
+    function saveToUserSet() {
+        const which = document.getElementById('userset').value || 'UserSet1';
+        if (which === 'Default') {
+            alert('"Default" is factory-read-only. Pick UserSet1 / 2 / 3.');
+            return;
+        }
+        cmd('save_to_userset', {
+            userset:     which,
+            set_default: document.getElementById('userset_boot').checked,
+        });
+    }
+
+    // Repopulate enum dropdowns from schema. Preserves currently-
+    // selected value if still valid; otherwise falls back to the
+    // camera's reported current.
+    function repopulate(selectId, values, cur) {
+        const el = document.getElementById(selectId);
+        if (!el || !values || !values.length) return;
+        const prev = el.value;
+        el.innerHTML = '';
+        for (const v of values) {
+            const opt = document.createElement('option');
+            opt.value = v;
+            opt.textContent = v;
+            el.appendChild(opt);
+        }
+        // Prefer keeping the user's previous selection if valid; fall
+        // back to the camera's reported current.
+        if (values.includes(prev)) el.value = prev;
+        else if (cur && values.includes(cur)) el.value = cur;
+    }
+
+    // Feature-name → input id mapping for numeric constraints.
+    const INPUT_BINDINGS = {
+        ExposureTime:         'exp',
+        Gain:                 'gain',
+        AcquisitionFrameRate: 'fps',
+        Width:                'roi_w',
+        Height:               'roi_h',
+        OffsetX:              'roi_x',
+        OffsetY:              'roi_y',
+    };
+
+    function bindRange(inputId, f) {
+        const el = document.getElementById(inputId);
+        if (!el) return;
+        if (f.min != null) el.min = f.min;
+        if (f.max != null) el.max = f.max;
+        if (f.inc != null) el.step = f.inc;
+        const unit = f.unit ? ' ' + f.unit : '';
+        el.title = `${f.label}: ${f.min} .. ${f.max}${unit}`
+                 + (f.inc ? ` (step ${f.inc})` : '');
+    }
+
+    function applySchema(schema) {
+        if (!schema || !schema.features) return;
+        for (const f of schema.features) {
+            if (f.type === 'enum') {
+                if (f.name === 'PixelFormat')        repopulate('pixfmt',   f.values, f.cur);
+                else if (f.name === 'TriggerSource') repopulate('trig_src', f.values, f.cur);
+                else if (f.name === 'UserSetSelector') repopulate('userset', f.values, f.cur);
+            } else if (f.type === 'int' || f.type === 'float') {
+                const id = INPUT_BINDINGS[f.name];
+                if (id) bindRange(id, f);
+            }
+        }
     }
 
     function renderDevices(labels, keys) {
@@ -238,12 +339,15 @@
         if (document.activeElement !== el) el.value = value;
     }
 
+    // Schema responses arrive on the same 'status' channel — distinguish
+    // by the presence of a `features` array. Also auto-refresh schema
+    // once after each (re)connect so the dropdowns reflect the current
+    // camera's actual capabilities.
+    let prevConnected = false;
     window.addEventListener('message', e => {
         if (e.data.type !== 'status') return;
         const s = e.data;
-        // get_preview replies share the same channel but have a different
-        // payload shape — skip the field-by-field stomp below when we see
-        // one (it's handled by the dedicated preview listener further down).
+        if (Array.isArray(s.features)) { applySchema(s); return; }
         if ('has_frame' in s && !('connected' in s)) return;
         setPill('connPill',   !!s.connected, 'connected',  'disconnected');
         setPill('streamPill', !!s.streaming, 'streaming',  'stopped');
@@ -274,6 +378,11 @@
             document.getElementById('strict_timeout').value = s.strict_timeout_ms ?? 0;
         document.getElementById('err').textContent      = s.last_error || '';
         if (s.devices) renderDevices(s.devices, s.device_keys);
+        // On the transition disconnected→connected, pull the schema so
+        // enum dropdowns (pixel format, trigger source, user-sets) get
+        // populated from the camera's actual supported values.
+        if (!prevConnected && s.connected) cmd('get_schema');
+        prevConnected = !!s.connected;
     });
 
     // Preview stream: get_preview comes back via the same 'status' channel,
