@@ -99,6 +99,9 @@ if (rec["missed"].as_bool()) {
 | `disconnect` | Stop + release |
 | `start_streaming` / `stop_streaming` | Manual `MV_CC_StartGrabbing` / `StopGrabbing` |
 | `set_roi` / `set_frame_rate` / `set_exposure` / `set_gain` / `set_mirror` / `set_pixel_format` | Runtime tuning |
+| `reset_roi` | Snap ROI back to the sensor's native max dimensions |
+| `set_feature` with `name`, `type` (`int`/`float`/`bool`/`enum`/`command`/`string`), `value` | Generic GenICam node setter; dispatches to the right `MV_CC_Set*` and reads the node back so the reply's `cur` reflects the camera's actually-applied (possibly clamped / snapped) value. Lets the UI drive any node exposed by `get_schema` without a hardcoded command per feature |
+| `get_schema` | Dump every supported node grouped by purpose (see [Schema groups](#schema-groups)). The UI uses this to render its control panels |
 
 ### Trigger + strict mode
 
@@ -120,6 +123,26 @@ if (rec["missed"].as_bool()) {
 | `get_edge_counter` | Reads the camera's `Counter0Value` — usable only if the firmware supports continuous edge counting (not on either of our tested models) |
 | `debug_counter_src` with `value` | Probe which `CounterEventSource` enum values the firmware accepts (diagnostic) |
 | `debug_drop_every_n` with `value` | Test-only — silently discard every Nth frame in `consume_frame` to exercise drop-handling code paths |
+
+---
+
+## Schema groups
+
+`get_schema` returns a `features` array plus a `groups` array that orders the panels the UI renders. Each feature has `name` / `label` / `group` / `type` (`int`/`float`/`bool`/`enum`/`string`) / `cur`, plus `min`/`max`/`inc`/`unit` for numerics and `values` for enums. Pair with `set_feature` to write any of them.
+
+| Group | Purpose | Notable nodes |
+|---|---|---|
+| `device` | Read-only identity + thermals (asset-tag fodder) | `DeviceVendorName`, `DeviceModelName`, `DeviceSerialNumber`, `DeviceFirmwareVersion`, `DeviceUserID`, `DeviceTemperature` |
+| `image` | Resolution + ROI + pixel format | `PixelFormat`, `Width`, `Height`, `OffsetX`, `OffsetY`, `ReverseX`/`ReverseY` |
+| `exposure` | Exposure, gain, and auto-control bounds/target | `ExposureAuto`, `ExposureTime`, `GainAuto`, `Gain`, `AutoExposureTimeLowerLimit`/`UpperLimit`, `AutoGainLowerLimit`/`UpperLimit`, `AETargetValue` |
+| `acquisition` | Frame rate + (where supported) shutter mode | `AcquisitionMode`, `AcquisitionFrameRate`, `ResultingFrameRate` (ro), `SensorShutterMode`, `GlobalResetReleaseMode` |
+| `trigger` | Trigger selector / mode / source / activation / delay | `TriggerSelector`, `TriggerMode`, `TriggerSource`, `TriggerActivation`, `TriggerDelay` |
+| `io` | Per-line GPIO config (selector pattern), strobe, user-output, timer. `LineSelector` / `UserOutputSelector` / `TimerSelector` gate the rest — the UI re-pulls the schema after each selector change so the dependent nodes refresh | `LineSelector`, `LineMode`, `LineSource`, `LineInverter`, `LineStatus` (ro), `LineStatusAll` (ro), `LineDebouncerTime`, `StrobeEnable` / `StrobeLineSource` / `StrobeLineDuration` / `StrobeLineDelay` / `StrobeLinePreDelay`, `UserOutputSelector` / `UserOutputValue` / `UserOutputValueAll` (ro), `TimerSelector` / `TimerDuration` / `TimerDelay` / `TimerTriggerSource` / `TimerTriggerActivation` |
+| `color` | Tonemap / white balance / black level (color sensors only — silently skipped on mono) | `GammaEnable`, `Gamma`, `BalanceWhiteAuto`, `BalanceRatioSelector`, `BalanceRatio`, `Saturation`, `Hue`, `Sharpness`, `Brightness`, `BlackLevelEnable`, `BlackLevel`, `DigitalShiftEnable`, `DigitalShift` |
+| `transport` | Link / throughput diagnostics | `DeviceLinkSpeedInBps`, `DeviceLinkCurrentThroughput` |
+| `userset` | User-set load / save selector | `UserSetSelector` |
+
+Nodes the connected firmware doesn't expose are silently omitted, so the same schema shape works across mono / color and small / large sensors — the UI filters to what's actually present.
 
 ---
 
@@ -219,6 +242,8 @@ With `Anyway`, the camera accepts edges from any Line0/1/2 but silences the name
 
 Once a device is opened in the current process, a subsequent `EnumDevices` call from another plugin instance doesn't see it. **Fix**: discover once globally, then connect each instance by `device_key` (not `index`).
 
+There's also a second reason to avoid `index`: MVS enumerates every supported transport (USB3 *and* GigE), so a non-HikRobot GEV device on the same network — e.g. a WTX1000 code reader — can land at `index=0` and silently steal the connection. The Line0 trigger path then sees zero edges and the test hangs at `drain=0`. Stick to `device_key` + the `USB:` prefix filter.
+
 ### 10. `Counter0` is one-shot on HikRobot USB3 firmware
 
 `CounterSelector=Counter0` + `CounterEventSource=Line0` is accepted by the firmware and the counter ticks to 1 on the first edge — then stops. It's structurally a "count to N and signal" primitive, not a free-running tally. `FrameStart`/`ExposureStart`/`Line0RisingEdge` are **rejected** as event sources on our firmware. **Fix**: the plugin uses the `Line0RisingEdge` event for edge counting instead, which works reliably (see Detection #2).
@@ -280,7 +305,10 @@ rejected by fw:     FrameTrigger, FrameTriggerMiss,
 | `hikrobot_event_probe` | Which events the firmware supports on one camera | 1 camera + ESP32 |
 | `hikrobot_event_probe_all` | Same, iterated across all connected cameras | All cameras + ESP32 |
 | `hikrobot_counter_probe` | Which `CounterEventSource` values the firmware honours | 1 camera + ESP32 |
-| **`hikrobot_stress`** | Multi-cam 300 triggers @ 30 Hz with 25% forced drops | 2 cameras + ESP32 |
+| `hikrobot_io_probe` | Iterate `LineSelector` (Line0/1/2) + `UserOutputSelector`; print the `io` features each selector state exposes | 1 camera |
+| `hikrobot_io_line1` | Select `Line1`, dump `get_schema` (quick look at `LineSource` enum on an output line) | 1 camera |
+| **`hikrobot_stress`** | Multi-cam HW-triggered soak with 25% forced drops; CLI: `hikrobot_stress <N> <HZ>` (defaults `300 30`) | 2 cameras + ESP32 |
+| **`hikrobot_surge`** | 10 Hz baseline + 4-edge burst at 200 Hz + 10 Hz recovery; verifies sensor-busy reject gets `missed=firmware_reported` with intact timestamps | 1 camera + ESP32 |
 
 ### Measured stress-test result
 
@@ -304,7 +332,7 @@ Real-frame interval at 30 Hz:           mean 33.32 ms, min 32.29, max 34.26 (std
 
 - **`tools/reset_cameras.ps1`** — PnP disable/enable for HikRobot VID (`2BDF`). Run when MVS starts returning `USB_WRITE` on every feature set.
 - **`../../trigger_peripheral/`** — ESP32 `xtrig` firmware driving hardware triggers. See its README for wiring + command protocol.
-- **`ui/index.html`** — webview with live JPEG preview + trigger / strict-mode / stats panels.
+- **`ui/index.html`** — webview with live JPEG preview, trigger / strict-mode / stats panels, schema-driven device-info / auto-exposure-bounds / digital-IO / color panels (all rendered from `get_schema`), plus a drag-to-frame ROI overlay on the preview that maps to sensor-pixel coordinates and calls `set_roi` (paired with a "Reset ROI" button that calls `reset_roi`).
 
 ---
 
