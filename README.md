@@ -4,18 +4,57 @@ xInsp2 image-source plugin for HikRobot / HIKVISION industrial cameras via the M
 
 **Key feature**: *strict trigger mode* — a 1:1 invariant between external trigger edges and `process()` outputs. Every edge that fires produces exactly one record in order; edges whose frames were lost become placeholder records with `missed:true` and accurate camera-clock timestamps. Downstream pipelines can index by `trigger_id` without ever losing alignment.
 
+### Design philosophy
+
+This plugin delivers **one honestly-labelled record per hardware trigger** — nothing more, nothing less. It does not group frames into batches, correlate across cameras, or infer illumination/light state. Every record carries `trigger_id`, `ts_trigger_ns`, `ts_device_ns`, `trigger_source`, and counters — the facts the camera actually knows.
+
+Grouping, pairing, batch assembly, and cross-source alignment are **downstream** responsibilities. The caller knows its own batch semantics (single-camera multi-light bursts, cross-camera asynchronous batches, mixed-rate sources) and uses the plugin's timestamps + source labels + its own ordering to assemble higher-level structure. This keeps the plugin's primitive identical across every deployment shape, and keeps application logic out of the driver.
+
+The caller drives with `process()` — it *pulls* the next record, it isn't *pushed* a latest-wins frame. That gives the downstream pipeline complete control over which trigger it's processing.
+
 ---
 
-## Quick build
+## Contents
 
-Requires HikRobot MVS. `MVCAM_COMMON_RUNENV` (set by the MVS installer) or `-DMVS_ROOT=<Development-folder>` points the CMake at the SDK.
+- [Build requirements](#build-requirements) · [Quick build](#quick-build)
+- [`xi::Record` output shape](#xirecord-output-shape)
+- [Config fields](#config-fields-persisted-in-instancejson)
+- [Architecture & data flow](#architecture--data-flow)
+- [Exchange commands](#exchange-commands) · [Schema groups](#schema-groups)
+- [Consuming the plugin from a pipeline](#consuming-the-plugin-from-a-pipeline)
+- [Detection mechanisms](#detection-mechanisms) (how 1:1 is preserved under drops)
+- [HikRobot MVS caveats](#hikrobot-mvs-caveats-found-during-development) (13 items; every one cost a debug cycle)
+- [Verified-on matrix](#verified-on) · [Test matrix](#test-matrix)
+- [UI panel guide](#ui-panel-guide) · [Troubleshooting](#troubleshooting)
+- [Wiring a hardware trigger](#wiring-a-hardware-trigger)
+
+---
+
+## Build requirements
+
+| Component | Minimum | Notes |
+|---|---|---|
+| **HikRobot MVS** | Any recent (tested: `MVS_x64_V4.3.x`) | Sets `MVCAM_COMMON_RUNENV` on install; plugin uses that, or override with `-DMVS_ROOT=<Development-folder>` |
+| **OS** | Windows 10 / 11 x64 | MVS is Windows-only in practice; plugin code is Windows-specific (uses `windows.h` for the ESP32 COM port in tests) |
+| **Compiler** | MSVC v143 (VS 2022) | Anything supporting C++20 and the xInsp2 SDK |
+| **CMake** | 3.20+ | xInsp2's plugin helper requires it |
+| **xInsp2 SDK** | head (auto-detected) | `XINSP2_ROOT` env var, or CMake walks parents looking for `sdk/cmake/xinsp2_plugin.cmake` |
+| **ESP32 `xtrig`** | only for HW-trigger tests | see `../../trigger_peripheral/` |
+
+## Quick build
 
 ```
 cmake -S . -B build -A x64
 cmake --build build --config Release
 ```
 
-Outputs the plugin DLL plus all test binaries next to `plugin.json`.
+Outputs the plugin DLL plus all test binaries next to `plugin.json`. Subsequent `cmake --build` calls are incremental — the DLL and only the touched test binaries rebuild.
+
+To build just the plugin without the test gauntlet:
+
+```
+cmake --build build --config Release --target hikrobot_camera
+```
 
 ---
 
@@ -88,6 +127,69 @@ if (rec["missed"].as_bool()) {
 
 ---
 
+## Architecture & data flow
+
+```
+   external edge  ──▶  camera Line0 opto input
+                           │
+                           │ firmware
+                           ▼
+                     ┌────────────┐      Line0RisingEdge
+                     │  MVS SDK   │──────▶ event callback  ──▶  push empty slot
+                     │            │                            (device_ns, trigger_ns)
+                     │ USB stream │
+                     └─────┬──────┘
+                           │
+                           │ frame callback                    ┌─────────────┐
+                           ▼           fill oldest unfilled    │ strict_slot │
+                     consume_frame ───────────────────────────▶│    queue    │
+                     (nFrameNum gap                            │   (FIFO)    │
+                      detect, build                            └──────┬──────┘
+                      xi::Image,                                      │
+                      convert pixel                    host thread    │
+                      format)                     process() pops ─────┘
+                           │                             │
+                           │ counter-mismatch reaper     ▼
+                           ├─ stale-slot sweep      xi::Record
+                           ├─ synth missed slots     (to the
+                           └─ match info poll        pipeline)
+```
+
+The design is a **pull-based SPSC queue between MVS's callback threads and the host's inspection thread**. Events arrive out-of-order with frames, so every edge creates a pristine slot first (getting the authoritative per-edge camera clock) and frames fill slots FIFO. Missed slots always carry their own `device_ns` from the event that created them — timestamps never vanish even when the frame does.
+
+### Thread model
+
+| Thread | Entered from | Does what |
+|---|---|---|
+| **Inspection thread** (xInsp2 host) | `process()` | Pops the next slot from the strict queue; returns the record. No I/O, no blocking work. |
+| **MVS image callback** (`frame_cb`) | MVS internal thread pool (1 per camera) | Builds `xi::Image` (zero-copy for Mono8/RGB8/BGR8, copy-convert for Bayer), fills oldest unfilled slot, bumps counters. Pixel format conversion is the hot path — optimised to stay under USB inter-frame time. |
+| **MVS event callback** (`event_cb`) | MVS internal thread pool | Records `Line0RisingEdge` / `Line0FallingEdge` device timestamps; pushes pristine slots on rising edges. |
+| **Counter-mismatch reaper** (`reaper_thread_`) | Plugin-owned, started on connect | 50 ms tick: after `counter_poll_idle_ms` idle, compares `line0_edges` to `captured + missed`, ages stale pending slots, polls `MV_CC_GetAllMatchInfo` ~1 Hz for transport stats. |
+| **Exchange handler** | Host inspection thread (different call site) | Runs the `exchange()` dispatch (feature writes, discover, connect, etc.); holds a recursive mutex around MVS control operations so it can't race the reaper or callbacks. |
+
+All queue mutations are `std::mutex`-protected; reads of atomic counters (`line0_edges_`, `captured_`, `missed_`, etc.) are lock-free. `process()` blocks briefly (waits on a condition variable) only when the queue is empty and strict mode is on — with `strict_timeout_ms` as the ceiling.
+
+### Trigger slot lifecycle
+
+```
+  ┌──▶ pending   ──(frame callback fills)──▶  filled
+  │     │  │                                    │
+  │     │  └─(stale-slot sweep)──▶ missed       │
+  │     │    reason=firmware_reported           │
+  │     │                                       │
+  │     └─(reaper, counter mismatch)──▶ missed  │
+  │        reason=counter_mismatch              │
+  │                                             │
+  │   (flush_pending from host)──▶ missed       │
+  │    reason=flushed                           │
+  │                                             ▼
+  └────────────── process() pops ◀──────────────┘
+```
+
+Slots are created pristine (with device_ns + trigger_ns from the event), reach a terminal state (filled or missed-with-reason), and only then are popped by `process()`. This ordering is what makes the 1:1 invariant hold: a slot can't be popped while still in flight.
+
+---
+
 ## Exchange commands
 
 ### Connect / configure
@@ -143,6 +245,75 @@ if (rec["missed"].as_bool()) {
 | `userset` | User-set load / save selector | `UserSetSelector` |
 
 Nodes the connected firmware doesn't expose are silently omitted, so the same schema shape works across mono / color and small / large sensors — the UI filters to what's actually present.
+
+---
+
+## Consuming the plugin from a pipeline
+
+The canonical consumer is an xInsp2 script or downstream plugin that pulls one record per `process()` call and inspects its fields.
+
+### Free-run (one frame per call, whatever the camera last produced)
+
+```cpp
+auto rec = cam->process({});
+if (rec["error"].as_string() == "no_pending_trigger") {
+    // Nothing arrived in this tick — try again next frame
+    return;
+}
+auto& img = rec.get_image("out");
+int fid   = rec["frame_id"].as_int();
+```
+
+### Strict HW-trigger (1:1 with external edges, with missed placeholders)
+
+```cpp
+auto rec = cam->process({});
+
+int64_t tid          = rec["trigger_id"].as_int();
+int64_t ts_trigger   = rec["ts_trigger_ns"].as_int();   // host steady_clock at edge
+int64_t ts_device    = rec["ts_device_ns"].as_int();    // camera-clock ticks
+std::string source   = rec["trigger_source"].as_string(); // "hardware" / "software"
+
+if (rec["missed"].as_bool()) {
+    std::string why = rec["miss_reason"].as_string();
+    // transmission_drop | counter_mismatch | firmware_reported | flushed | timeout
+    log_missed(tid, ts_trigger, ts_device, why);
+    advance_pipeline_index(tid);   // KEEP THE SLOT — critical for alignment
+    return;
+}
+
+auto& img = rec.get_image("out");
+inspect(tid, img, ts_trigger);
+```
+
+### Multi-camera: caller-driven alignment
+
+The plugin does not correlate across cameras. The consumer pulls from each camera independently and uses `trigger_id` (or `ts_device_ns`, or batch tags it applied via `exchange`) to pair them:
+
+```cpp
+auto r0 = cam0->process({});
+auto r1 = cam1->process({});
+
+// If the two cams share a hardware trigger, their trigger_ids advance
+// in lockstep — align by id:
+assert(r0["trigger_id"].as_int() == r1["trigger_id"].as_int());
+
+// For multi-light / multi-batch use cases, the caller's own sequence
+// number (not the camera's trigger_id) is the source of truth — pair
+// by that.
+```
+
+Batch assembly (e.g. single camera firing N times under N different lamps) is the **caller's** job: it knows the lamp sequence and maps `trigger_id → lamp_index`. The plugin only guarantees that `trigger_id` advances monotonically per edge received.
+
+### Ending a burst cleanly
+
+When the caller knows the hardware trigger source has stopped (e.g. an ESP32 `DONE` line, or a host-side counter), call `flush_pending` with the total edge count so any unfilled slots are explicitly marked missed — otherwise the reaper takes up to `counter_poll_idle_ms` to mark them:
+
+```cpp
+cam->exchange(R"({"command":"flush_pending","expected":100})");
+// After this returns, exactly 100 process() calls will drain and
+// every slot will be in a terminal state.
+```
 
 ---
 
@@ -332,7 +503,84 @@ Real-frame interval at 30 Hz:           mean 33.32 ms, min 32.29, max 34.26 (std
 
 - **`tools/reset_cameras.ps1`** — PnP disable/enable for HikRobot VID (`2BDF`). Run when MVS starts returning `USB_WRITE` on every feature set.
 - **`../../trigger_peripheral/`** — ESP32 `xtrig` firmware driving hardware triggers. See its README for wiring + command protocol.
-- **`ui/index.html`** — webview with live JPEG preview, trigger / strict-mode / stats panels, schema-driven device-info / auto-exposure-bounds / digital-IO / color panels (all rendered from `get_schema`), plus a drag-to-frame ROI overlay on the preview that maps to sensor-pixel coordinates and calls `set_roi` (paired with a "Reset ROI" button that calls `reset_roi`).
+- **`ui/index.html`** — webview (see [UI panel guide](#ui-panel-guide) below).
+
+---
+
+## UI panel guide
+
+`ui/index.html` is the webview the xInsp2 host loads for this plugin. It's schema-driven — most of its controls are rendered from `get_schema`, so they automatically adapt to each camera model's exposed node set (no per-model code). Panels:
+
+| Panel | Purpose |
+|---|---|
+| **Devices** | List from `discover`; shows connection state and lets you connect/disconnect by `device_key` |
+| **Preview** | Live JPEG thumbnail polled via `get_preview`. Drag a rectangle on top to frame an ROI; "Apply ROI from selection" converts preview-pixel coords to sensor-pixel coords and calls `set_roi`. "Reset ROI (full res)" calls `reset_roi` |
+| **Trigger** | `set_trigger_mode` (off / on × source), strict-mode toggle + timeout, software-trigger fire, `flush_pending` |
+| **Trigger stats** | Live counters: `captured`, `missed`, `dropped`, `line0_edges`, `line0_falling_edges`, overruns |
+| **Device info** | Read-only: vendor, model, serial, firmware version, user ID, sensor temperature (from `device` schema group) |
+| **Exposure / Gain** | Main `ExposureTime` / `Gain` / `AcquisitionFrameRate` controls, plus the `Auto*LowerLimit` / `UpperLimit` / `AETargetValue` bounds that the continuous-auto loop uses |
+| **Digital I/O** | `LineSelector` picks a physical line; then `LineMode` / `LineSource` / `LineInverter` / debouncer configure it. Also Strobe (`StrobeEnable` / source / duration / delays), UserOutput, Timer. Nodes that aren't exposed by this camera are silently omitted |
+| **Color / tonemap** | Gamma, white balance, saturation, hue, sharpness, black level, digital shift. Empty on mono cameras |
+| **User-sets** | Load / save into `UserSet1..3` and pick a default |
+
+Most UI actions go through the generic `set_feature` exchange command — the plugin dispatches by node type (int/float/bool/enum/command/string), writes the node, and returns the camera's actually-applied `cur` value (which may differ from what was sent because the firmware clamps or snaps to increments). The UI then re-renders that field with the authoritative value.
+
+---
+
+## Troubleshooting
+
+Symptoms you'll actually hit, and what to do:
+
+### `drain=0`, `line0_edges=0` after firing triggers
+
+The camera sees no edges. In order of likelihood:
+
+1. **Connected to the wrong device.** If the bus also has a GEV device like a WTX1000 code reader, `connect index=0` will pick that up — it has no Line0 and no events fire. Connect by `device_key` with the `USB:` prefix. See caveat [#9](#9-mv_cc_enumdevices-doesnt-return-claimed-devices).
+2. **Line0 voltage below the opto threshold.** ESP32 3.3 V GPIO directly on Line0 usually doesn't latch. Level-shift to 5 V or use an opto driver. See [Wiring a hardware trigger](#wiring-a-hardware-trigger).
+3. **TriggerSource = Anyway.** Frames arrive but `Line0RisingEdge` events don't fire (caveat [#7](#7-triggersourceanyway-suppresses-the-frametrigger-event)). Use `Line0` as the source.
+4. **ESP32 isn't actually firing.** Verify independently by running `hikrobot_two_cam.exe` (reference HW-trigger test) — if it works, the ESP32 path is OK.
+
+### `drain=N` but `real=0` (all placeholders, `missed=true` everywhere)
+
+Edges arrive but the sensor never delivers frames. Causes:
+
+1. **Exposure > inter-trigger period.** The sensor is still integrating when the next edge arrives. Reduce `exposure_us` below `1e6 / trigger_hz`.
+2. **Rolling shutter stretched by large ROI at high trigger rate.** Drop ROI or rate, or switch to a model with faster readout.
+3. **USB 2.0 port.** Camera reports `ResultingFrameRate` fine but throughput is throttled. Confirm with `diag` → `DeviceLinkCurrentThroughput` (caveat [#6](#6-usb-20-throttling-is-silent)).
+
+### Feature writes fail right after connect (`MVS err=0x80000301 / 0x80000100 / 0x80000102`)
+
+Stale USB state from a prior crashed process, or the camera is in a wedged session:
+
+1. `tools/reset_cameras.ps1` (PnP disable/enable the HikRobot VID) — the nuclear option.
+2. Unplug and replug.
+3. Sometimes a `disconnect` then fresh `connect` is enough.
+
+Caveats [#1](#1-feature-writes-fail-with-mv_e_usb_write-0x80000301-right-after-opendevice), [#2](#2-previous-crashed-processes-can-leave-the-camera-streaming).
+
+### Frames arrive but at ≤ 1 fps, camera says it *should* be faster
+
+`AcquisitionFrameRate` isn't enabled by default (caveat [#5](#5-acquisitionframerate-defaults-to-disabled)). Call `set_frame_rate` with a positive value; the plugin sets `AcquisitionFrameRateEnable=true` + the value in one shot.
+
+### Two cameras: first `start_streaming` on cam 1 fails with `MV_E_USB_WRITE`
+
+Concurrent USB control-channel contention (caveat [#12](#12-concurrent-two-camera-startup-races-at-the-usb-control-channel)). The plugin already retries up to 5 times with 150 ms spacing — if it still fails, stagger the connects manually with a sleep between them.
+
+### Missed slot has `ts_device_ns=0`
+
+The edge was synthesized without a matching event — usually because `flush_pending` ran with no corresponding `Line0RisingEdge` ever firing. That's expected: `flushed` placeholders carry `ts_device_ns=0` honestly rather than making up a value. If you need the timestamp, fall back to `ts_trigger_ns` or schedule-estimate from the caller's burst plan.
+
+### Diagnostic toolbox
+
+| Command / tool | Tells you |
+|---|---|
+| `exchange({"command":"diag"})` | Raw GenICam node dump (ExposureTime, TriggerMode, ResultingFrameRate, DeviceLinkCurrentThroughput, etc.) |
+| `exchange({"command":"get_status"})` | Live counters (captured, dropped, missed, line0_edges, transport errors) |
+| `exchange({"command":"probe_events","names":[...]})` | Which events the firmware accepts for this model |
+| `hikrobot_event_probe.exe` | Same, iterated across all event names |
+| `hikrobot_io_probe.exe` | Which IO nodes each `LineSelector` / `UserOutputSelector` value exposes |
+| `hikrobot_two_cam.exe` | Reference end-to-end HW-trigger test — if this passes, the rig is healthy |
+| `hikrobot_stress.exe <N> <HZ>` | Long-rate soak with forced drops; confirms the 1:1 invariant under pressure |
 
 ---
 
