@@ -119,7 +119,7 @@ struct Cam {
     }
 };
 
-int main() {
+int main(int argc, char** argv) {
     HMODULE dll = LoadLibraryA(HIKROBOT_CAMERA_DLL_PATH);
     if (!dll) return die("LoadLibrary");
     auto syms = xi::baseline::load_symbols(dll);
@@ -153,8 +153,12 @@ int main() {
     if (!trig.open("COM4", 115200)) { cam0.teardown(syms); cam1.teardown(syms); return die("COM4"); }
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
 
-    const int N  = 300;
-    const int HZ = 30;
+    // Allow CLI override: `hikrobot_stress <N> <HZ>`. Defaults match
+    // the 30 Hz x 300 torture from the README.
+    int N  = 300;
+    int HZ = 30;
+    if (argc >= 2) N  = std::atoi(argv[1]);
+    if (argc >= 3) HZ = std::atoi(argv[2]);
     std::printf("firing %d edges at %d Hz on MASK=0x3 (~%d s), drop every 4th in each plugin...\n\n",
                 N, HZ, N / HZ);
     char fire[80];

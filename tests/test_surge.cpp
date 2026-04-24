@@ -99,8 +99,24 @@ int main() {
     syms.exchange(inst, R"({"command":"set_trigger_mode","mode":"on","source":"Line0"})",buf, sizeof(buf));
     syms.exchange(inst, R"({"command":"set_strict_trigger_mode","value":true,"timeout_ms":2000})",
                   buf, sizeof(buf));
+    // Pick the first USB3 HikRobot device from discover — `index=0`
+    // can resolve to a non-HikRobot GEV device (e.g. a WTX1000 code
+    // reader) if one is on the bus, leaving us with zero Line0 edges.
     syms.exchange(inst, R"({"command":"discover"})", buf, sizeof(buf));
-    syms.exchange(inst, R"({"command":"connect","index":0})", buf, sizeof(buf));
+    std::string usb_key;
+    {
+        const char* p = std::strstr(buf, "\"USB:");
+        if (p) {
+            const char* e = std::strchr(p + 1, '"');
+            if (e) usb_key.assign(p + 1, e - p - 1);
+        }
+    }
+    if (usb_key.empty()) return die("no USB3 HikRobot device in discover");
+    char connect_cmd[256];
+    std::snprintf(connect_cmd, sizeof(connect_cmd),
+                  R"({"command":"connect","device_key":"%s"})", usb_key.c_str());
+    std::printf("connecting to %s\n", usb_key.c_str());
+    syms.exchange(inst, connect_cmd, buf, sizeof(buf));
     if (!has_lit(buf, "connected", "true")) return die("connect");
 
     Serial trig;
