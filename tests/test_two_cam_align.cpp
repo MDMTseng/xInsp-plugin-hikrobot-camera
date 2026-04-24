@@ -436,42 +436,24 @@ int main() {
     std::printf("both cameras armed (strict, Line0, split connect→arm flow)\n\n");
 
 
-    // Wiring probe: fire each MASK alone for 5 pulses @ 5 Hz and read
-    // back each cam's line0_edges to see which cam is on which ESP32
-    // pin (GPIO 32 = MASK 0x1, GPIO 33 = MASK 0x2).
-    const int N = 25;
-    auto read_edges = [&](Cam& c) {
-        char sb[4096];
-        syms.exchange(c.inst, R"({"command":"get_status"})", sb, sizeof(sb));
-        return peek_int(sb, "line0_edges");
+    // 15 Hz baseline with surges, 20 s duration. Pattern per cycle:
+    //   60 @ 15 Hz = 4 s baseline
+    //   6  @ 250 Hz surge
+    //   repeat 5x = 20.2 s total
+    // Each cycle = 66 edges; total 330 edges per cam.
+    const int CYCLES = 5;
+    const int N = (60 + 6) * CYCLES;  // 330
+    std::printf("15 Hz + surge for 20s: %d cycles of (60@15Hz + 6@250Hz surge) = %d edges\n\n",
+                CYCLES, N);
+    auto fire = [&](const char* cmd, int settle_ms) {
+        trig.write_line(cmd);
+        std::this_thread::sleep_for(std::chrono::milliseconds(settle_ms));
     };
-
-    std::printf("\n=== wiring probe ===\n");
-    int A0 = read_edges(A), B0 = read_edges(B);
-
-    std::printf("fire 5 @ 5 Hz on MASK=0x1 (GPIO 32)\n");
-    trig.write_line("BURST N=5 HZ=5 WIDTH=200 MASK=0x1");
-    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
-    int A1 = read_edges(A), B1 = read_edges(B);
-    std::printf("  A received %d edges, B received %d edges\n", A1 - A0, B1 - B0);
-
-    std::printf("fire 5 @ 5 Hz on MASK=0x2 (GPIO 33)\n");
-    trig.write_line("BURST N=5 HZ=5 WIDTH=200 MASK=0x2");
-    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
-    int A2 = read_edges(A), B2 = read_edges(B);
-    std::printf("  A received %d edges, B received %d edges\n", A2 - A1, B2 - B1);
-
-    std::printf("fire 5 @ 5 Hz on MASK=0x3 (both pins)\n");
-    trig.write_line("BURST N=5 HZ=5 WIDTH=200 MASK=0x3");
-    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
-    int A3 = read_edges(A), B3 = read_edges(B);
-    std::printf("  A received %d edges, B received %d edges\n\n", A3 - A2, B3 - B2);
-
-    // Main capture run.
-    std::printf("simple 5 Hz x 2 s on both cams (MASK=0x3)\n\n");
-    trig.write_line("BURST N=10 HZ=5 WIDTH=200 MASK=0x3");
-    std::this_thread::sleep_for(std::chrono::milliseconds(2500));
-    std::this_thread::sleep_for(std::chrono::seconds(2));
+    for (int i = 0; i < CYCLES; ++i) {
+        fire("BURST N=60 HZ=15 WIDTH=200 MASK=0x3", 4100);
+        fire("BURST N=6  HZ=250 WIDTH=200 MASK=0x3", 300);
+    }
+    std::this_thread::sleep_for(std::chrono::seconds(3));
 
     // Pre-drain status: report actual resolution + sensor-level counters
     // so we can tell whether the camera really shot at full res and
@@ -525,6 +507,14 @@ int main() {
     int big_trig_skew    = 0;
     int prev_bad_dev_A   = 0;
     int prev_bad_dev_B   = 0;
+    // Stricter per-cam 1:1 integrity checks (for 15 Hz + surge test).
+    int prev_bad_trig_A  = 0;   // trigger_ns not monotonic within A
+    int prev_bad_trig_B  = 0;
+    int rows_zero_trig_A = 0;   // real rows with ts_trigger_ns == 0
+    int rows_zero_dev_A  = 0;   // real rows with ts_device_ns == 0
+    int rows_zero_trig_B = 0;
+    int rows_zero_dev_B  = 0;
+    int64_t lastA_trig = 0, lastB_trig = 0;
 
     std::printf("%-4s %-8s %-8s %-6s %-6s %-12s %-12s %-12s\n",
                 "idx", "A.tid", "B.tid", "A.k", "B.k",
@@ -563,9 +553,24 @@ int main() {
         if (i > 0) {
             if (a.dev_ns && lastA_dev && a.dev_ns <= lastA_dev) ++prev_bad_dev_A;
             if (b.dev_ns && lastB_dev && b.dev_ns <= lastB_dev) ++prev_bad_dev_B;
+            if (a.trig_ns && lastA_trig && a.trig_ns <= lastA_trig) ++prev_bad_trig_A;
+            if (b.trig_ns && lastB_trig && b.trig_ns <= lastB_trig) ++prev_bad_trig_B;
         }
-        if (a.dev_ns) lastA_dev = a.dev_ns;
-        if (b.dev_ns) lastB_dev = b.dev_ns;
+        if (a.dev_ns)  lastA_dev  = a.dev_ns;
+        if (b.dev_ns)  lastB_dev  = b.dev_ns;
+        if (a.trig_ns) lastA_trig = a.trig_ns;
+        if (b.trig_ns) lastB_trig = b.trig_ns;
+        // Real rows must carry both timestamps populated. A missed slot
+        // is allowed to have dev_ns = 0 (unknown) but a real captured
+        // row with no timestamp means the plugin lost track.
+        if (!a.missed) {
+            if (!a.trig_ns) ++rows_zero_trig_A;
+            if (!a.dev_ns)  ++rows_zero_dev_A;
+        }
+        if (!b.missed) {
+            if (!b.trig_ns) ++rows_zero_trig_B;
+            if (!b.dev_ns)  ++rows_zero_dev_B;
+        }
     }
 
     // Per-cam: compare host trigger_ns gap vs device_ns gap across
@@ -619,10 +624,16 @@ int main() {
                 "tid mismatches: %d\n"
                 "miss pattern mismatches: %d\n"
                 "|skew| > 5 ms rows: %d\n"
-                "non-monotonic device_ns (A / B): %d / %d\n",
+                "non-monotonic device_ns (A / B): %d / %d\n"
+                "non-monotonic trigger_ns (A / B): %d / %d\n"
+                "real rows missing trigger_ns (A / B): %d / %d\n"
+                "real rows missing device_ns  (A / B): %d / %d\n",
                 rowsA.size(), rowsB.size(), N,
                 tid_mismatches, miss_mismatches, big_trig_skew,
-                prev_bad_dev_A, prev_bad_dev_B);
+                prev_bad_dev_A, prev_bad_dev_B,
+                prev_bad_trig_A, prev_bad_trig_B,
+                rows_zero_trig_A, rows_zero_trig_B,
+                rows_zero_dev_A,  rows_zero_dev_B);
 
     stop_monitor();
     teardown(syms, A);

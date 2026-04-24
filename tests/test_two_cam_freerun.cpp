@@ -93,8 +93,8 @@ int main() {
         return {};
     };
     // Pair: working 5 MP CA050 + 20 MP CE200-UC "TopView".
-    std::string keyA = find_key("00F50664114");  // MV-CA050-11UM
-    std::string keyB = find_key("00K79315117");  // MV-CE200-11UC "TopView"
+    std::string keyA = find_key("00DA5328883");  // CE200 20MP TEST
+    std::string keyB = find_key("K47674142");    // CA050 5MP
     if (keyA.empty() || keyB.empty()) {
         if (keys.size() < 2) return die("need 2 cameras visible to MVS");
         keyA = keys[0]; keyB = keys[1];
@@ -103,7 +103,7 @@ int main() {
 
     Cam A{"camA_freerun", keyA};
     Cam B{"camB_freerun", keyB};
-    const double TARGET_FPS = 10.0;
+    const double TARGET_FPS = 0.0;  // uncapped
     const int    DURATION_S = 10;
 
     if (!configure_freerun(syms, &host, A, TARGET_FPS)) { teardown(syms, B); return die("configure A"); }

@@ -204,6 +204,27 @@ public:
     // Returns iterator to the slot (filled OR missed) with the smallest
     // device_ns — the next one ready to emit in physical order. Again
     // device_ns==0 ranks last, with stable push-order tiebreak.
+    // Find the slot whose device_ns matches `target_device_ns` within a
+    // small tolerance. Frames carry their own device_ns in
+    // MV_FRAME_OUT_INFO — matching by that is robust against
+    // event-vs-frame arrival reordering (event for edge N can lag the
+    // frame for edge N in rare cases). Returns pending_.end() on no
+    // match; caller can fall back to pick_oldest_unfilled.
+    auto pick_by_device_ns(int64_t target_device_ns, int64_t tol_ticks = 1000) {
+        auto best = pending_.end();
+        int64_t best_diff = INT64_MAX;
+        for (auto it = pending_.begin(); it != pending_.end(); ++it) {
+            if (it->filled || it->missed) continue;
+            if (it->device_ns == 0) continue;  // synth/software slot, not a real edge stamp
+            int64_t diff = std::abs(it->device_ns - target_device_ns);
+            if (diff <= tol_ticks && diff < best_diff) {
+                best_diff = diff;
+                best = it;
+            }
+        }
+        return best;
+    }
+
     auto pick_oldest_ready() {
         auto best = pending_.end();
         int64_t best_key = INT64_MAX;
@@ -1566,18 +1587,27 @@ private:
                 missed_count_.fetch_add(1);
             }
 
-            // Fill the oldest (by device_ns) pristine slot with this
-            // frame — the one that physically corresponds to the next
-            // edge the sensor read out.
+            // Primary match: use the frame's own device_ns (from
+            // MV_FRAME_OUT_INFO) to find the slot whose Line0RisingEdge
+            // event stamped the same tick. Handles event-vs-frame
+            // reordering: even if the event for this edge hasn't hit
+            // our callback yet, we know the frame's own device_ns, and
+            // if the event IS in pending_ already (regardless of push
+            // order), we'll pair them correctly.
+            //
+            // Fallback: if no slot matches (event truly not pushed yet,
+            // or a synth slot with device_ns=0), fill the oldest-unfilled
+            // slot — same behavior as before. In practice the fallback
+            // rarely fires on this MVS stack because events always
+            // arrive well before their frame's USB transfer completes.
             {
-                auto it = pick_oldest_unfilled();
+                auto it = pick_by_device_ns(frame_device_ns);
+                if (it == pending_.end()) it = pick_oldest_unfilled();
                 if (it != pending_.end()) {
                     it->frame       = std::move(img);
                     it->filled      = true;
                     it->received_ns = t_now;
                     it->host_ns     = frame_host_ns;
-                    // Preserve the slot's original device_ns (captured
-                    // from the Line0RisingEdge event) — true edge time.
                     if (it->device_ns == 0) it->device_ns = frame_device_ns;
                     if (it->trigger_ns == 0) it->trigger_ns = t_now;
                 }

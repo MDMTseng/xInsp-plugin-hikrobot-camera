@@ -148,6 +148,14 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_ts_dump.cpp)
     add_dependencies(hikrobot_ts_dump hikrobot_camera)
 endif()
 
+# --- Trigger probe: which ESP32 pin reaches which camera --------------
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_trig_probe.cpp)
+    xinsp2_add_plugin_test(hikrobot_trig_probe tests/test_trig_probe.cpp)
+    target_compile_definitions(hikrobot_trig_probe PRIVATE
+        HIKROBOT_CAMERA_DLL_PATH="${CMAKE_CURRENT_SOURCE_DIR}/hikrobot_camera.dll")
+    add_dependencies(hikrobot_trig_probe hikrobot_camera)
+endif()
+
 # --- Probe any cam at its persisted ROI (no ROI change) ---------------
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_any_cam_noroi.cpp)
     xinsp2_add_plugin_test(hikrobot_any_cam_noroi tests/test_any_cam_noroi.cpp)
@@ -170,6 +178,14 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_ca050_alone.cpp)
     target_compile_definitions(hikrobot_ca050_alone PRIVATE
         HIKROBOT_CAMERA_DLL_PATH="${CMAKE_CURRENT_SOURCE_DIR}/hikrobot_camera.dll")
     add_dependencies(hikrobot_ca050_alone hikrobot_camera)
+endif()
+
+# --- Free-run ALL cams streaming uncapped, measure throughput ---------
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_all_cam_freerun.cpp)
+    xinsp2_add_plugin_test(hikrobot_all_cam_freerun tests/test_all_cam_freerun.cpp)
+    target_compile_definitions(hikrobot_all_cam_freerun PRIVATE
+        HIKROBOT_CAMERA_DLL_PATH="${CMAKE_CURRENT_SOURCE_DIR}/hikrobot_camera.dll")
+    add_dependencies(hikrobot_all_cam_freerun hikrobot_camera)
 endif()
 
 # --- Free-run four-cam streaming at 10 fps each -----------------------

@@ -41,7 +41,10 @@ static double diag_max(const char* db, const char* key) {
 
 int main(int argc, char** argv) {
     const char* key = argc > 1 ? argv[1] : nullptr;
-    if (!key) { std::fprintf(stderr, "usage: %s <USB:SERIAL>\n", argv[0]); return 1; }
+    // Optional 2nd arg: target fps. 0 = uncapped (disable AFR) to measure
+    // the camera's max sensor rate at whatever USB topology it's on.
+    double target_fps = argc > 2 ? std::atof(argv[2]) : 10.0;
+    if (!key) { std::fprintf(stderr, "usage: %s <USB:SERIAL> [fps (0=uncap)]\n", argv[0]); return 1; }
 
     HMODULE dll = LoadLibraryA(HIKROBOT_CAMERA_DLL_PATH);
     auto syms  = xi::baseline::load_symbols(dll);
@@ -83,7 +86,10 @@ int main(int argc, char** argv) {
     std::snprintf(roi, sizeof(roi),
         R"({"command":"set_roi","x":0,"y":0,"w":%d,"h":%d})", wmax, hmax);
     syms.exchange(inst, roi, buf, sizeof(buf));
-    syms.exchange(inst, R"({"command":"set_frame_rate","value":10})", buf, sizeof(buf));
+    char fpscmd[128];
+    std::snprintf(fpscmd, sizeof(fpscmd),
+        R"({"command":"set_frame_rate","value":%g})", target_fps);
+    syms.exchange(inst, fpscmd, buf, sizeof(buf));
     syms.exchange(inst, R"({"command":"discover"})", buf, sizeof(buf));
     char cmd[256];
     std::snprintf(cmd, sizeof(cmd), R"({"command":"connect","device_key":"%s"})", key);
@@ -120,10 +126,14 @@ int main(int argc, char** argv) {
     // One-line verdict: key | dims | target | actual | captured | err
     int captured = cap1 - cap0;
     int errors   = err1 - err0;
+    // Under "uncapped" mode the resulting fps is whatever the sensor does;
+    // verdict should be OK as long as we're delivering close to it.
+    const int expected = target_fps > 0 ? (int)(target_fps * 5 * 0.9)
+                                        : (int)(resulting_fps * 5 * 0.9);
     const char* verdict =
-        (captured >= 45 && errors == 0) ? "OK"        :
-        (captured == 0)                 ? "NO_FRAMES" :
-                                          "DEGRADED";
+        (captured >= expected && errors == 0) ? "OK"        :
+        (captured == 0)                       ? "NO_FRAMES" :
+                                                "DEGRADED";
     std::printf("%-20s  %dx%-4d  prog=%.1f  resulting=%.1f  captured=%-3d errors=%-3d  %s\n",
         key, wmax, hmax, programmed_fps, resulting_fps,
         captured, errors, verdict);
