@@ -156,6 +156,22 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_trig_probe.cpp)
     add_dependencies(hikrobot_trig_probe hikrobot_camera)
 endif()
 
+# --- IO Line1 probe ---------------------------------------------------
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_io_line1.cpp)
+    xinsp2_add_plugin_test(hikrobot_io_line1 tests/test_io_line1.cpp)
+    target_compile_definitions(hikrobot_io_line1 PRIVATE
+        HIKROBOT_CAMERA_DLL_PATH="${CMAKE_CURRENT_SOURCE_DIR}/hikrobot_camera.dll")
+    add_dependencies(hikrobot_io_line1 hikrobot_camera)
+endif()
+
+# --- IO probe: iterate LineSelector / UserOutputSelector --------------
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_io_probe.cpp)
+    xinsp2_add_plugin_test(hikrobot_io_probe tests/test_io_probe.cpp)
+    target_compile_definitions(hikrobot_io_probe PRIVATE
+        HIKROBOT_CAMERA_DLL_PATH="${CMAKE_CURRENT_SOURCE_DIR}/hikrobot_camera.dll")
+    add_dependencies(hikrobot_io_probe hikrobot_camera)
+endif()
+
 # --- Probe any cam at its persisted ROI (no ROI change) ---------------
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_any_cam_noroi.cpp)
     xinsp2_add_plugin_test(hikrobot_any_cam_noroi tests/test_any_cam_noroi.cpp)

@@ -109,11 +109,20 @@
 </div>
 
 <h3>Preview</h3>
-<div id="preview-wrap">
+<div id="preview-wrap" style="position:relative; user-select:none;">
     <img id="preview" style="display:none">
     <div id="preview-empty">no frame yet</div>
+    <!-- overlay: drag to frame an ROI on the preview -->
+    <canvas id="roi-overlay"
+            style="position:absolute; left:0; top:0; pointer-events:auto; cursor:crosshair;">
+    </canvas>
 </div>
-<div class="stat">preview frame_id: <span id="preview_frame_id">—</span></div>
+<div class="row" style="margin-top:4px;">
+    <span class="stat">preview frame_id: <span id="preview_frame_id">—</span></span>
+    <span class="stat">selection: <span id="roi_sel">— drag to frame —</span></span>
+    <button onclick="applySelectionRoi()">Apply ROI from selection</button>
+    <button class="secondary" onclick="cmd('reset_roi')">Reset ROI (full res)</button>
+</div>
 
 <h3>Trigger</h3>
 <div class="row">
@@ -150,6 +159,26 @@
     sent: <span id="trig_sent">0</span> ·
     accepted: <span id="trig_acc">0</span> ·
     <span style="color:#ff8a80">overruns: <span id="trig_over">0</span></span>
+</div>
+
+<h3>Device info</h3>
+<div id="device-group">
+    <div class="stat">populated from schema on connect</div>
+</div>
+
+<h3>Auto exposure / gain bounds</h3>
+<div id="exposure-extra-group">
+    <div class="stat">populated from schema — applies when Auto is enabled</div>
+</div>
+
+<h3>Digital I/O (strobe, user outputs)</h3>
+<div id="io-group">
+    <div class="stat">populated from schema — select a line, then set mode/source/invert</div>
+</div>
+
+<h3>Color / tonemap</h3>
+<div id="color-group">
+    <div class="stat">populated from schema on connect (color cameras only)</div>
 </div>
 
 <h3>User-set / save / reset</h3>
@@ -294,6 +323,120 @@
                  + (f.inc ? ` (step ${f.inc})` : '');
     }
 
+    // Generic set_feature command — one dispatcher for every node the
+    // camera exposes. The UI below uses it for the color/IO/device
+    // groups. Enum-selector nodes (LineSelector, UserOutputSelector,
+    // BalanceRatioSelector...) gate the visibility of dependent nodes
+    // on the camera side — re-pull schema after every set so the
+    // schema-rendered groups refresh.
+    function setFeature(name, type, value) {
+        cmd('set_feature', { name, type, value });
+        // 250 ms lets MVS's control-channel write settle before we
+        // query the dependent feature's new cur value.
+        setTimeout(() => cmd('get_schema'), 250);
+    }
+
+    // Build a control row for one schema feature (used by the color
+    // panel). Returns a DOM <div class="row"> already wired up.
+    function buildFeatureRow(f) {
+        const row = document.createElement('div');
+        row.className = 'row';
+        const label = document.createElement('label');
+        label.textContent = f.label || f.name;
+        row.appendChild(label);
+        if (f.readonly || f.type === 'string') {
+            // Read-only device info / strings — render as label + value.
+            const span = document.createElement('span');
+            span.textContent = String(f.cur != null ? f.cur : '—');
+            span.style.fontFamily = 'monospace';
+            span.style.opacity = '0.9';
+            row.appendChild(span);
+            if (f.unit) {
+                const u = document.createElement('span');
+                u.className = 'stat';
+                u.textContent = f.unit;
+                row.appendChild(u);
+            }
+            return row;
+        }
+        if (f.type === 'bool') {
+            const cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.checked = !!f.cur;
+            cb.onchange = () => setFeature(f.name, 'bool', cb.checked);
+            row.appendChild(cb);
+        } else if (f.type === 'enum') {
+            const sel = document.createElement('select');
+            for (const v of (f.values || [])) {
+                const o = document.createElement('option');
+                o.value = v; o.textContent = v;
+                sel.appendChild(o);
+            }
+            if (f.cur) sel.value = f.cur;
+            sel.onchange = () => setFeature(f.name, 'enum', sel.value);
+            row.appendChild(sel);
+        } else {   // int / float
+            const inp = document.createElement('input');
+            inp.type = 'number';
+            if (f.min != null) inp.min = f.min;
+            if (f.max != null) inp.max = f.max;
+            if (f.inc != null) inp.step = f.inc;
+            if (f.type === 'float' && f.inc == null) inp.step = 'any';
+            inp.value = f.cur != null ? f.cur : '';
+            inp.style.width = '110px';
+            row.appendChild(inp);
+            const btn = document.createElement('button');
+            btn.textContent = 'Apply';
+            btn.onclick = () => setFeature(f.name, f.type, +inp.value);
+            row.appendChild(btn);
+            const tip = document.createElement('span');
+            tip.className = 'stat';
+            tip.textContent = `[${f.min}..${f.max}${f.unit ? ' ' + f.unit : ''}]`;
+            row.appendChild(tip);
+        }
+        return row;
+    }
+
+    function renderGroupInto(hostId, features, groupName, emptyMsg) {
+        const host = document.getElementById(hostId);
+        if (!host) return;
+        const feats = features.filter(f => f.group === groupName);
+        if (feats.length === 0) {
+            host.innerHTML = '<div class="stat">' + emptyMsg + '</div>';
+            return;
+        }
+        host.innerHTML = '';
+        for (const f of feats) host.appendChild(buildFeatureRow(f));
+    }
+
+    function renderColorGroup(features) {
+        renderGroupInto('color-group', features, 'color',
+            'no color features on this camera (mono sensor)');
+    }
+    function renderDeviceGroup(features) {
+        renderGroupInto('device-group', features, 'device',
+            'no device-info nodes exposed');
+    }
+    function renderIoGroup(features) {
+        renderGroupInto('io-group', features, 'io',
+            'no digital I/O nodes on this camera');
+    }
+    function renderExposureExtraGroup(features) {
+        // Only the auto-bound features; the main Exposure/Gain/FPS
+        // controls stay hardcoded above.
+        const names = ['AutoExposureTimeLowerLimit', 'AutoExposureTimeUpperLimit',
+                       'AutoGainLowerLimit', 'AutoGainUpperLimit', 'AETargetValue'];
+        const host = document.getElementById('exposure-extra-group');
+        if (!host) return;
+        const feats = features.filter(f => names.includes(f.name));
+        if (feats.length === 0) {
+            host.innerHTML = '<div class="stat">auto-bound nodes not exposed on this camera</div>';
+            return;
+        }
+        host.innerHTML = '';
+        for (const f of feats) host.appendChild(buildFeatureRow(f));
+    }
+
     function applySchema(schema) {
         if (!schema || !schema.features) return;
         for (const f of schema.features) {
@@ -306,6 +449,130 @@
                 if (id) bindRange(id, f);
             }
         }
+        renderColorGroup(schema.features);
+        renderDeviceGroup(schema.features);
+        renderIoGroup(schema.features);
+        renderExposureExtraGroup(schema.features);
+        // Stash current sensor dims for ROI coordinate mapping.
+        const W = schema.features.find(f => f.name === 'Width');
+        const H = schema.features.find(f => f.name === 'Height');
+        if (W && H) {
+            sensorMaxW = W.max || 0;
+            sensorMaxH = H.max || 0;
+            sensorCurW = W.cur || 0;
+            sensorCurH = H.cur || 0;
+        }
+    }
+
+    // -------- ROI framing on the preview --------
+    // Drag a rectangle on the preview image. "Apply ROI from selection"
+    // scales the rectangle from preview pixels to sensor pixels and
+    // sends set_roi. "Reset ROI" calls the plugin's reset_roi command.
+    let sensorMaxW = 0, sensorMaxH = 0;
+    let sensorCurW = 0, sensorCurH = 0;
+    let roiSel = null;  // { x0, y0, x1, y1 } in preview-canvas coords
+    let roiDragging = false;
+
+    function roiCanvas() { return document.getElementById('roi-overlay'); }
+    function roiSyncSize() {
+        const img = document.getElementById('preview');
+        const c = roiCanvas();
+        if (!c || !img.complete || img.naturalWidth === 0) return;
+        // Size canvas to match displayed preview size.
+        const rect = img.getBoundingClientRect();
+        c.width  = img.clientWidth;
+        c.height = img.clientHeight;
+        c.style.width  = img.clientWidth  + 'px';
+        c.style.height = img.clientHeight + 'px';
+        roiDraw();
+    }
+    function roiDraw() {
+        const c = roiCanvas();
+        if (!c) return;
+        const g = c.getContext('2d');
+        g.clearRect(0, 0, c.width, c.height);
+        if (!roiSel) return;
+        g.strokeStyle = '#ffb020';
+        g.lineWidth   = 2;
+        const x = Math.min(roiSel.x0, roiSel.x1);
+        const y = Math.min(roiSel.y0, roiSel.y1);
+        const w = Math.abs(roiSel.x1 - roiSel.x0);
+        const h = Math.abs(roiSel.y1 - roiSel.y0);
+        g.strokeRect(x, y, w, h);
+        g.fillStyle = 'rgba(255,176,32,0.12)';
+        g.fillRect(x, y, w, h);
+    }
+
+    (function initRoiOverlay() {
+        const c = roiCanvas();
+        const img = document.getElementById('preview');
+        if (!c || !img) return;
+        const canvasXY = (e) => {
+            const r = c.getBoundingClientRect();
+            return [e.clientX - r.left, e.clientY - r.top];
+        };
+        c.addEventListener('mousedown', e => {
+            const [x, y] = canvasXY(e);
+            roiSel = { x0: x, y0: y, x1: x, y1: y };
+            roiDragging = true;
+            roiDraw();
+        });
+        c.addEventListener('mousemove', e => {
+            if (!roiDragging) return;
+            const [x, y] = canvasXY(e);
+            roiSel.x1 = x; roiSel.y1 = y;
+            roiDraw();
+            updateSelStatus();
+        });
+        window.addEventListener('mouseup', () => {
+            roiDragging = false;
+            updateSelStatus();
+        });
+        // Keep canvas overlay aligned with the image as it loads/resizes.
+        img.addEventListener('load',   roiSyncSize);
+        window.addEventListener('resize', roiSyncSize);
+    })();
+
+    function selectionToSensorBox() {
+        if (!roiSel) return null;
+        const img = document.getElementById('preview');
+        if (!img.clientWidth || !img.clientHeight) return null;
+        if (!sensorCurW || !sensorCurH) return null;
+        // Preview-canvas coords → sensor-pixel coords via the image's
+        // displayed dimensions (NOT naturalWidth, since the preview
+        // is downscaled by the plugin).
+        const sx = sensorCurW / img.clientWidth;
+        const sy = sensorCurH / img.clientHeight;
+        const x = Math.round(Math.min(roiSel.x0, roiSel.x1) * sx);
+        const y = Math.round(Math.min(roiSel.y0, roiSel.y1) * sy);
+        const w = Math.round(Math.abs(roiSel.x1 - roiSel.x0) * sx);
+        const h = Math.round(Math.abs(roiSel.y1 - roiSel.y0) * sy);
+        return { x, y, w, h };
+    }
+    function updateSelStatus() {
+        const el = document.getElementById('roi_sel');
+        if (!el) return;
+        const b = selectionToSensorBox();
+        if (!b || b.w < 4 || b.h < 4) {
+            el.textContent = '— drag to frame —';
+        } else {
+            el.textContent = `${b.x},${b.y}  ${b.w}×${b.h}  (sensor px)`;
+        }
+    }
+    function applySelectionRoi() {
+        const b = selectionToSensorBox();
+        if (!b || b.w < 8 || b.h < 8) {
+            alert('Drag a rectangle on the preview first.');
+            return;
+        }
+        cmd('set_roi', b);
+        // The camera snaps to its increment — re-pull schema to get the
+        // actual applied values back.
+        setTimeout(() => cmd('get_schema'), 200);
+        setTimeout(() => cmd('get_status'), 200);
+        roiSel = null;
+        roiDraw();
+        updateSelStatus();
     }
 
     function renderDevices(labels, keys) {

@@ -436,6 +436,81 @@ public:
         else if (command == "get_preview")       return get_preview_json(p["max_side"].as_int(480),
                                                                           p["quality"].as_int(70));
         else if (command == "diag")              return diag_json();
+        else if (command == "set_feature") {
+            // Generic GenICam node setter — caller supplies name, type,
+            // value and the plugin dispatches to the right MV_CC_Set*.
+            // Reads the value back after writing so the reply contains
+            // the camera's ACTUALLY-applied value (may be clamped or
+            // snapped to increments).
+            if (!handle_) return R"({"ok":false,"error":"not_connected"})";
+            std::string name = p["name"].as_string("");
+            std::string type = p["type"].as_string("");
+            if (name.empty() || type.empty())
+                return R"({"ok":false,"error":"name_and_type_required"})";
+            auto reply = xi::Json::object();
+            reply.set("name", name);
+            reply.set("type", type);
+            int r = MV_OK;
+            if (type == "int") {
+                int64_t v = p["value"].as_int(0);
+                r = MV_CC_SetIntValueEx(handle_, name.c_str(), v);
+                MVCC_INTVALUE rb{};
+                if (MV_CC_GetIntValue(handle_, name.c_str(), &rb) == MV_OK)
+                    reply.set("cur", (int)rb.nCurValue);
+            } else if (type == "float") {
+                double v = p["value"].as_double(0);
+                r = MV_CC_SetFloatValue(handle_, name.c_str(), (float)v);
+                MVCC_FLOATVALUE rb{};
+                if (MV_CC_GetFloatValue(handle_, name.c_str(), &rb) == MV_OK)
+                    reply.set("cur", (double)rb.fCurValue);
+            } else if (type == "bool") {
+                bool v = p["value"].as_bool(false);
+                r = MV_CC_SetBoolValue(handle_, name.c_str(), v);
+                bool rb = false;
+                if (MV_CC_GetBoolValue(handle_, name.c_str(), &rb) == MV_OK)
+                    reply.set("cur", rb);
+            } else if (type == "enum") {
+                std::string v = p["value"].as_string("");
+                r = MV_CC_SetEnumValueByString(handle_, name.c_str(), v.c_str());
+                MVCC_ENUMVALUE rb{};
+                if (MV_CC_GetEnumValue(handle_, name.c_str(), &rb) == MV_OK) {
+                    MVCC_ENUMENTRY e{};
+                    e.nValue = rb.nCurValue;
+                    if (MV_CC_GetEnumEntrySymbolic(handle_, name.c_str(), &e) == MV_OK)
+                        reply.set("cur", e.chSymbolic);
+                }
+            } else if (type == "command") {
+                r = MV_CC_SetCommandValue(handle_, name.c_str());
+            } else if (type == "string") {
+                std::string v = p["value"].as_string("");
+                r = MV_CC_SetStringValue(handle_, name.c_str(), v.c_str());
+                MVCC_STRINGVALUE rb{};
+                if (MV_CC_GetStringValue(handle_, name.c_str(), &rb) == MV_OK)
+                    reply.set("cur", rb.chCurValue);
+            } else {
+                reply.set("ok", false);
+                reply.set("error", "unknown_type");
+                return reply.dump();
+            }
+            reply.set("ok", r == MV_OK);
+            if (r != MV_OK) reply.set("mvs_err", r);
+            return reply.dump();
+        }
+        else if (command == "reset_roi") {
+            // Snap ROI back to the sensor's native max dimensions.
+            if (!handle_) return R"({"ok":false,"error":"not_connected"})";
+            MVCC_INTVALUE wv{}, hv{};
+            int rw = MV_CC_GetIntValue(handle_, "Width",  &wv);
+            int rh = MV_CC_GetIntValue(handle_, "Height", &hv);
+            if (rw != MV_OK || rh != MV_OK)
+                return R"({"ok":false,"error":"cannot_read_dims"})";
+            apply_roi(0, 0, (int)wv.nMax, (int)hv.nMax);
+            return xi::Json::object()
+                .set("ok", true)
+                .set("w", (int)roi_w_)
+                .set("h", (int)roi_h_)
+                .dump();
+        }
         else if (command == "get_schema")        return get_schema_json();
         else if (command == "save_to_userset") {
             // Persist current camera settings into a writable UserSet
@@ -1719,6 +1794,19 @@ private:
             row.set("cur",   b);
             arr.push(row);
         };
+        auto add_string = [&](const char* key, const char* label,
+                              const char* group) {
+            MVCC_STRINGVALUE v{};
+            if (MV_CC_GetStringValue(handle_, key, &v) != MV_OK) return;
+            auto row = xi::Json::object();
+            row.set("name",  key);
+            row.set("label", label);
+            row.set("group", group);
+            row.set("type",  "string");
+            row.set("cur",   v.chCurValue);
+            row.set("readonly", true);
+            arr.push(row);
+        };
         auto add_enum = [&](const char* key, const char* label,
                             const char* group) {
             MVCC_ENUMVALUE v{};
@@ -1749,6 +1837,14 @@ private:
             arr.push(row);
         };
 
+        // Device info (all read-only, useful for production asset tags).
+        add_string("DeviceVendorName",        "Vendor",                "device");
+        add_string("DeviceModelName",         "Model",                 "device");
+        add_string("DeviceSerialNumber",      "Serial",                "device");
+        add_string("DeviceFirmwareVersion",   "Firmware",              "device");
+        add_string("DeviceUserID",            "User ID",               "device");
+        add_float("DeviceTemperature",        "Sensor temperature",    "device", "°C");
+
         // Image group
         add_enum ("PixelFormat",              "Pixel format",          "image");
         add_int  ("Width",                    "Width",                 "image");
@@ -1763,6 +1859,14 @@ private:
         add_float("ExposureTime",             "Exposure",              "exposure", "us");
         add_enum ("GainAuto",                 "Gain auto",             "exposure");
         add_float("Gain",                     "Gain",                  "exposure", "dB");
+        // Auto-mode bounds & target — the control loop uses these when
+        // ExposureAuto / GainAuto are set to Continuous or Once. Naming
+        // varies slightly across HikRobot firmwares (AE vs AutoExp).
+        add_float("AutoExposureTimeLowerLimit", "Auto-exp min",        "exposure", "us");
+        add_float("AutoExposureTimeUpperLimit", "Auto-exp max",        "exposure", "us");
+        add_float("AutoGainLowerLimit",         "Auto-gain min",       "exposure", "dB");
+        add_float("AutoGainUpperLimit",         "Auto-gain max",       "exposure", "dB");
+        add_int  ("AETargetValue",              "Auto target",         "exposure");
 
         // Acquisition group
         add_enum ("AcquisitionMode",          "Acquisition mode",      "acquisition");
@@ -1782,14 +1886,77 @@ private:
         add_int  ("DeviceLinkSpeedInBps",     "Link speed (B/s)",      "transport");
         add_int  ("DeviceLinkCurrentThroughput","Throughput (B/s)",    "transport");
 
+        // Sensor shutter / global-reset. Names vary by firmware — the
+        // add_* helpers silently skip any node the camera doesn't
+        // expose. Most HikRobot CMOS cams have rolling shutter with an
+        // optional "GlobalReset" mode (simultaneous exposure of every
+        // row, controlled by either SensorShutterMode or a bool).
+        add_enum ("SensorShutterMode",        "Shutter mode",          "acquisition");
+        add_bool ("GlobalResetReleaseMode",   "Global reset (enable)", "acquisition");
+        add_bool ("GlobalResetEnable",        "Global reset enable",   "acquisition");
+
+        // Digital I/O — per-line control (selector pattern) plus the
+        // common strobe / user-output / debouncer nodes. Any node the
+        // camera doesn't expose is silently skipped. Switching
+        // LineSelector on the UI should re-pull schema so the
+        // per-line fields reflect the newly-selected line.
+        add_enum ("LineSelector",             "Line (select first)",   "io");
+        add_enum ("LineMode",                 "Line mode",             "io");
+        add_enum ("LineSource",               "Line source (if output)","io");
+        add_bool ("LineInverter",             "Line invert",           "io");
+        add_bool ("LineStatus",               "Line status (ro)",      "io");
+        add_int  ("LineStatusAll",            "All-line bitmap (ro)",  "io");
+        add_float("LineDebouncerTime",        "Line debouncer",        "io", "us");
+        add_enum ("LineFormat",               "Line format",           "io");
+
+        // Strobe: fires an output pulse tied to an exposure or trigger.
+        add_bool ("StrobeEnable",             "Strobe enable",         "io");
+        add_enum ("StrobeLineSource",         "Strobe source",         "io");
+        add_float("StrobeLineDuration",       "Strobe duration",       "io", "us");
+        add_float("StrobeLineDelay",          "Strobe delay",          "io", "us");
+        add_float("StrobeLinePreDelay",       "Strobe pre-delay",      "io", "us");
+
+        // User-programmable output bit — lets the host force a GPIO high
+        // or low independently of the exposure/trigger system.
+        add_enum ("UserOutputSelector",       "User-output (select)",  "io");
+        add_bool ("UserOutputValue",          "User-output value",     "io");
+        add_bool ("UserOutputValueAll",       "All-user-output (ro)",  "io");
+
+        // Counter / Timer — on firmwares that support them, these give
+        // a host-controlled one-shot pulse (TimerDuration long) out of
+        // any Line whose LineSource is "TimerActive". The host fires
+        // the timer via its TriggerSource (TimerTrigger command) and
+        // the pulse runs independently of exposure.
+        add_enum ("TimerSelector",            "Timer (select)",        "io");
+        add_float("TimerDuration",            "Timer duration",        "io", "us");
+        add_float("TimerDelay",               "Timer delay",           "io", "us");
+        add_enum ("TimerTriggerSource",       "Timer trigger source",  "io");
+        add_enum ("TimerTriggerActivation",   "Timer trigger edge",    "io");
+
+        // Color / tonemap group (color cameras only; silently skipped
+        // on mono sensors since those features are unavailable there).
+        add_bool ("GammaEnable",              "Gamma enable",          "color");
+        add_float("Gamma",                    "Gamma",                 "color", "");
+        add_enum ("BalanceWhiteAuto",         "White balance",         "color");
+        add_enum ("BalanceRatioSelector",     "WB channel",            "color");
+        add_float("BalanceRatio",             "WB ratio",              "color", "");
+        add_int  ("Saturation",               "Saturation",            "color");
+        add_int  ("Hue",                      "Hue",                   "color");
+        add_int  ("Sharpness",                "Sharpness",             "color");
+        add_int  ("Brightness",               "Brightness",            "color");
+        add_bool ("BlackLevelEnable",         "Black-level enable",    "color");
+        add_int  ("BlackLevel",               "Black level",           "color");
+        add_bool ("DigitalShiftEnable",       "Digital shift enable",  "color");
+        add_int  ("DigitalShift",             "Digital shift",         "color");
+
         // User-set management
         add_enum ("UserSetSelector",          "User-set selector",     "userset");
 
         auto root = xi::Json::object();
         root.set("features", arr);
         root.set("groups",   xi::Json::array()
-            .push("image").push("exposure").push("acquisition")
-            .push("trigger").push("transport").push("userset"));
+            .push("device").push("image").push("exposure").push("acquisition")
+            .push("trigger").push("io").push("color").push("transport").push("userset"));
         return root.dump();
     }
 
